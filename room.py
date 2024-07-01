@@ -2,233 +2,171 @@ import cv2
 import numpy as np
 import time
 from scipy.optimize import minimize
-from sklearn.cluster import KMeans
-from filterpy.kalman import KalmanFilter
+from sklearn.cluster import DBSCAN
 
 
-def process_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-    cap.release()
+class CameraModel:
+    def __init__(self, focal_length, principal_point, distortion_coeffs):
+        self.focal_length = focal_length
+        self.principal_point = principal_point
+        self.distortion_coeffs = distortion_coeffs
 
-    room_geometry, camera_params, pan_angles, zoom_values = reconstruct_scene(frames)
-    return room_geometry, camera_params, pan_angles, zoom_values
+    def project(self, points_3d):
+        if len(points_3d.shape) == 1:
+            points_3d = points_3d.reshape(1, -1)
 
+        x, y, z = points_3d[:, 0], points_3d[:, 1], points_3d[:, 2]
 
-def reconstruct_scene(frames):
-    initial_geometry = estimate_initial_geometry(frames[0])
-    initial_camera = estimate_initial_camera(frames[0])
-    initial_pan = np.zeros(len(frames))
-    initial_zoom = np.ones(len(frames))
+        # Add a small epsilon to avoid division by zero
+        z = np.where(z == 0, 1e-10, z)
 
-    iteration_count = 0
-    start_time = time.time()
+        x_prime = x / z
+        y_prime = y / z
 
-    def objective_function(params):
-        nonlocal iteration_count
-        room_params = params[:6]  # [width, length, height, x, y, z]
-        camera_params = params[6:13]  # [fx, fy, cx, cy, cam_x, cam_y, cam_z]
-        pan_angles = params[13:13 + len(frames)]
-        zoom_values = params[13 + len(frames):]
+        r2 = x_prime ** 2 + y_prime ** 2
 
-        error = 0
-        for i, frame in enumerate(frames):
-            projected_geometry = project_geometry(room_params, camera_params, pan_angles[i], zoom_values[i])
-            error += compute_error(frame, projected_geometry)
+        fx, fy = self.focal_length
+        cx, cy = self.principal_point
+        k1, k2, p1, p2, k3 = self.distortion_coeffs
 
-        # Add regularization terms
-        error += 0.1 * np.sum(np.diff(pan_angles) ** 2)  # Smoothness of pan angles
-        error += 10 * np.sum(np.diff(zoom_values) ** 2)  # Encourage step-like zoom function
+        radial_distortion = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+        tangential_x = 2 * p1 * x_prime * y_prime + p2 * (r2 + 2 * x_prime ** 2)
+        tangential_y = p1 * (r2 + 2 * y_prime ** 2) + 2 * p2 * x_prime * y_prime
 
-        # Add room proportion constraints
-        width, length, height = room_params[:3]
-        error += 1000 * max(0, width / length - 3)  # Width should not be more than 3 times the length
-        error += 1000 * max(0, length / width - 3)  # Length should not be more than 3 times the width
-        error += 1000 * max(0, height / width - 3)  # Height should not be more than 3 times the width
-        error += 1000 * max(0, height / length - 3)  # Height should not be more than 3 times the length
+        x_distorted = x_prime * radial_distortion + tangential_x
+        y_distorted = y_prime * radial_distortion + tangential_y
 
-        iteration_count += 1
-        elapsed_time = time.time() - start_time
-        print(f"Iteration {iteration_count}: Error = {error:.2f}, Time: {elapsed_time:.2f}s")
+        u = fx * x_distorted + cx
+        v = fy * y_distorted + cy
 
-        return error
+        return np.column_stack((u, v))
 
-    initial_params = np.concatenate([initial_geometry, initial_camera, initial_pan, initial_zoom])
+    def unproject(self, points_2d, depth):
+        fx, fy = self.focal_length
+        cx, cy = self.principal_point
 
-    # Add constraints (same as before)
-    constraints = [
-        {'type': 'ineq', 'fun': lambda x: x[12] - 0},  # cam_z >= 0
-        {'type': 'ineq', 'fun': lambda x: 2 - x[12]},  # cam_z <= 2
-        {'type': 'ineq', 'fun': lambda x: x[0] - 1},  # width >= 1 meter
-        {'type': 'ineq', 'fun': lambda x: x[1] - 1},  # length >= 1 meter
-        {'type': 'ineq', 'fun': lambda x: x[2] - 2},  # height >= 2 meters
-        {'type': 'ineq', 'fun': lambda x: 10 - x[0]},  # width <= 10 meters
-        {'type': 'ineq', 'fun': lambda x: 10 - x[1]},  # length <= 10 meters
-        {'type': 'ineq', 'fun': lambda x: 5 - x[2]},  # height <= 5 meters
-    ]
+        x = (points_2d[:, 0] - cx) / fx
+        y = (points_2d[:, 1] - cy) / fy
 
-    best_result = None
-    best_error = float('inf')
+        points_3d = np.column_stack((x * depth, y * depth, depth))
+        return points_3d
 
-    for init_attempt in range(5):  # Multiple initializations
-        print(f"\nInitialization attempt {init_attempt + 1}")
-        iteration_count = 0
+    def optimize_params(self, points_2d, points_3d):
+        def objective(params):
+            self.focal_length = params[:2]
+            self.principal_point = params[2:4]
+            self.distortion_coeffs = params[4:]
+            projected = self.project(points_3d)
+            return np.sum((points_2d - projected) ** 2)
+
+        initial_params = np.hstack((self.focal_length, self.principal_point, self.distortion_coeffs))
+
+        print("Starting camera parameter optimization")
         start_time = time.time()
 
-        result = minimize(objective_function, initial_params, method='SLSQP', constraints=constraints,
-                          options={'maxiter': 1000})
+        def callback(xk):
+            nonlocal start_time
+            elapsed_time = time.time() - start_time
+            error = objective(xk)
+            print(f"Camera optimization: Error = {error:.2f}, Time: {elapsed_time:.2f}s")
 
-        if result.fun < best_error:
-            best_result = result
-            best_error = result.fun
+        result = minimize(objective, initial_params, method='Powell', callback=callback)
 
-        print(f"Attempt {init_attempt + 1} finished. Final error: {result.fun:.2f}")
+        self.focal_length = result.x[:2]
+        self.principal_point = result.x[2:4]
+        self.distortion_coeffs = result.x[4:]
 
-        # Perturb initial params for next iteration
-        initial_params += np.random.normal(0, 0.1, len(initial_params))
+        print("Camera parameter optimization completed")
 
-    print(f"\nBest result achieved with error: {best_error:.2f}")
-
-    optimized_params = best_result.x
-    room_geometry = optimized_params[:6]
-    camera_params = optimized_params[6:13]
-    pan_angles = optimized_params[13:13 + len(frames)]
-    zoom_values = optimized_params[13 + len(frames):]
-
-    # Apply temporal smoothing
-    pan_angles = smooth_pan_angles(pan_angles)
-    zoom_values = smooth_zoom_values(zoom_values)
-
-    # Convert room dimensions to meters (assuming the camera height is in meters)
-    scale_factor = camera_params[6] / 1.0  # Assuming camera is at 1 meter height
-    room_geometry[:3] *= scale_factor
-    room_geometry[3:] *= scale_factor
-
-    return room_geometry, camera_params, pan_angles, zoom_values
-
-def estimate_initial_geometry(frame):
-    edges = cv2.Canny(frame, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
-
-    vanishing_points = estimate_vanishing_points(lines)
-    initial_geometry = estimate_room_dimensions(vanishing_points)
-
-    return initial_geometry
+    def get_params(self):
+        return np.hstack((self.focal_length, self.principal_point, self.distortion_coeffs))
 
 
-def estimate_initial_camera(frame):
-    height, width = frame.shape
-    focal_length = width  # Approximation
-    cx, cy = width / 2, height / 2
-
-    # Initial camera parameters: [fx, fy, cx, cy, cam_x, cam_y, cam_z]
-    return np.array([focal_length, focal_length, cx, cy, 0, 0, 1])
+class RoomModel:
+    def __init__(self, geometry, pan_angles, zoom_values):
+        self.geometry = geometry  # [width, length, height, x, y, z]
+        self.pan_angles = pan_angles
+        self.zoom_values = zoom_values
 
 
-def project_geometry(room_params, camera_params, pan_angle, zoom):
-    width, length, height, x, y, z = room_params
-    fx, fy, cx, cy, cam_x, cam_y, cam_z = camera_params
-
-    # Create 3D points for room corners
-    points_3d = np.array([
-        [x, y, z],
-        [x + width, y, z],
-        [x + width, y + length, z],
-        [x, y + length, z],
-        [x, y, z + height],
-        [x + width, y, z + height],
-        [x + width, y + length, z + height],
-        [x, y + length, z + height]
-    ])
-
-    # Apply camera position
-    points_3d -= np.array([cam_x, cam_y, cam_z])
-
-    # Create rotation matrix for pan
-    R = cv2.Rodrigues(np.array([0, pan_angle, 0]))[0]
-
-    # Apply rotation
-    points_3d = np.dot(points_3d, R.T)
-
-    # Create camera matrix with zoom
-    K = np.array([[fx * zoom, 0, cx], [0, fy * zoom, cy], [0, 0, 1]])
-
-    # Project 3D points to 2D
-    points_2d = np.dot(points_3d, K.T)
-    points_2d = points_2d[:, :2] / points_2d[:, 2:]
-
-    return points_2d
+def extract_features(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    edges = cv2.Canny(binary, 30, 100)  # Adjusted thresholds
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 30, minLineLength=30, maxLineGap=20)  # Adjusted parameters
+    corners = cv2.goodFeaturesToTrack(gray, 200, 0.005, 10)  # Increased number of corners, lowered quality level
+    if corners is not None:
+        corners = corners.reshape(-1, 2).astype(np.int32)
+    else:
+        corners = np.array([]).reshape(0, 2)
+    return edges, lines, corners
 
 
-def compute_error(frame, projected_geometry):
-    height, width = frame.shape
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    def to_int_tuple(point):
-        return tuple(map(int, map(round, point)))
-
-    # Draw projected geometry on mask
-    for i in range(4):
-        pt1 = to_int_tuple(projected_geometry[i])
-        pt2 = to_int_tuple(projected_geometry[(i + 1) % 4])
-        pt3 = to_int_tuple(projected_geometry[i + 4])
-        cv2.line(mask, pt1, pt2, 255, 2)
-        cv2.line(mask, pt1, pt3, 255, 2)
-
-    for i in range(4, 8):
-        pt1 = to_int_tuple(projected_geometry[i])
-        pt2 = to_int_tuple(projected_geometry[(i - 3) % 4 + 4])
-        cv2.line(mask, pt1, pt2, 255, 2)
-
-    # Compute error
-    edges = cv2.Canny(frame, 50, 150)
-    error = np.sum(np.abs(edges.astype(float) - mask.astype(float)))
-
-    return error
+def cluster_orientations(orientations):
+    orientations = orientations.reshape(-1, 1)
+    clustering = DBSCAN(eps=0.1, min_samples=5).fit(orientations)
+    return clustering.labels_
 
 
-def estimate_vanishing_points(lines):
-    def line_intersection(line1, line2):
-        x1, y1, x2, y2 = line1
-        x3, y3, x4, y4 = line2
-
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if denom == 0:
-            return None
-
-        px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denom
-        py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denom
-
-        return px, py
-
-    intersections = []
-    for i in range(len(lines)):
-        for j in range(i + 1, len(lines)):
-            intersection = line_intersection(lines[i][0], lines[j][0])
-            if intersection:
-                intersections.append(intersection)
-
-    # Cluster intersections to find vanishing points
-    kmeans = KMeans(n_clusters=3)
-    kmeans.fit(intersections)
-    vanishing_points = kmeans.cluster_centers_
-
-    return vanishing_points
+def find_dominant_orientations(clusters):
+    unique_labels, counts = np.unique(clusters, return_counts=True)
+    dominant_indices = np.argsort(counts)[-3:]  # Get indices of top 3 clusters
+    return unique_labels[dominant_indices]
 
 
-def estimate_room_dimensions(vanishing_points):
+def group_lines_by_orientation(lines, dominant_orientations):
+    orientations = np.array([np.arctan2(x2 - x1, y2 - y1) for (x1, y1, x2, y2) in lines[:, 0]])
+    grouped_lines = [[] for _ in range(len(dominant_orientations))]
+    for line, orientation in zip(lines, orientations):
+        closest_dominant = dominant_orientations[np.argmin(np.abs(orientation - dominant_orientations))]
+        grouped_lines[np.where(dominant_orientations == closest_dominant)[0][0]].append(line)
+    return grouped_lines
+
+
+def estimate_vanishing_points(grouped_lines):
+    vanishing_points = []
+    for group in grouped_lines:
+        if len(group) < 2:
+            continue
+        A = np.zeros((len(group), 2))
+        b = np.zeros((len(group), 1))
+        for i, line in enumerate(group):
+            x1, y1, x2, y2 = line[0]
+            A[i] = [y2 - y1, x1 - x2]
+            b[i] = x1 * y2 - x2 * y1
+        vp = np.linalg.lstsq(A, b, rcond=None)[0]
+        vanishing_points.append(vp.flatten())
+    return np.array(vanishing_points)
+
+
+def estimate_dimensions_from_vp(vanishing_points, corners):
     # This is a simplified estimation and may need refinement
-    vp1, vp2, vp3 = vanishing_points
-
-    # Estimate room width, length, and height based on vanishing point distances
-    width = np.linalg.norm(vp1 - vp2)
-    length = np.linalg.norm(vp2 - vp3)
-    height = np.linalg.norm(vp3 - vp1)
+    if len(vanishing_points) < 2:
+        print("Warning: Not enough vanishing points detected. Using fallback method.")
+        # Fallback method: use default values if not enough corners
+        if len(corners) < 2:
+            print("Warning: Not enough corners detected. Using default values.")
+            width, length, height = 1.0, 1.0, 1.0
+            center = [0, 0]
+        else:
+            min_corner = np.min(corners, axis=0)
+            max_corner = np.max(corners, axis=0)
+            width = max_corner[0] - min_corner[0]
+            height = max_corner[1] - min_corner[1]
+            length = (width + height) / 2  # Rough estimate
+            center = (min_corner + max_corner) / 2
+    elif len(vanishing_points) == 2:
+        vp1, vp2 = vanishing_points
+        width = np.linalg.norm(vp1 - vp2)
+        height = width * 0.75  # Assuming a typical room height
+        length = (width + height) / 2
+        center = np.mean(corners, axis=0) if len(corners) > 0 else [0, 0]
+    else:
+        vp1, vp2, vp3 = vanishing_points
+        width = np.linalg.norm(vp1 - vp2)
+        length = np.linalg.norm(vp2 - vp3)
+        height = np.linalg.norm(vp3 - vp1)
+        center = np.mean(corners, axis=0) if len(corners) > 0 else [0, 0]
 
     # Normalize dimensions
     total = width + length + height
@@ -236,40 +174,243 @@ def estimate_room_dimensions(vanishing_points):
     length /= total
     height /= total
 
-    # Assume room center is at (0, 0, 0)
-    return np.array([width, length, height, -width / 2, -length / 2, -height / 2])
+    return np.array([width, length, height, center[0], center[1], 0])
 
 
-def smooth_pan_angles(pan_angles):
-    kf = KalmanFilter(dim_x=2, dim_z=1)
-    kf.x = np.array([0., 0.])  # Initial state (angle and angular velocity)
-    kf.F = np.array([[1., 1.], [0., 1.]])  # State transition matrix
-    kf.H = np.array([[1., 0.]])  # Measurement function
-    kf.P *= 1000.  # Covariance matrix
-    kf.R = 0.1  # Measurement noise
-    kf.Q = np.array([[0.01, 0.01], [0.01, 0.1]])  # Process noise
+def estimate_room_geometry(lines, corners):
+    if lines is None or len(lines) < 2:
+        print("Warning: Not enough lines detected. Using fallback method.")
+        return estimate_dimensions_from_vp([], corners)
 
-    smoothed_angles = []
-    for angle in pan_angles:
-        kf.predict()
-        kf.update(angle)
-        smoothed_angles.append(kf.x[0])
-
-    return np.array(smoothed_angles)
+    orientations = np.array([np.arctan2(x2 - x1, y2 - y1) for (x1, y1, x2, y2) in lines[:, 0]])
+    orientation_clusters = cluster_orientations(orientations)
+    dominant_orientations = find_dominant_orientations(orientation_clusters)
+    grouped_lines = group_lines_by_orientation(lines, dominant_orientations)
+    vanishing_points = estimate_vanishing_points(grouped_lines)
+    room_dimensions = estimate_dimensions_from_vp(vanishing_points, corners)
+    return room_dimensions
 
 
-def smooth_zoom_values(zoom_values):
-    # Use total variation denoising for step-like function
-    from skimage.restoration import denoise_tv_chambolle
+def random_sample(features, n):
+    indices = np.random.choice(len(features), n, replace=False)
+    return [features[i] for i in indices]
 
-    smoothed_zoom = denoise_tv_chambolle(zoom_values, weight=0.1)
-    return smoothed_zoom
+
+def estimate_model(sample, camera_model):
+    # Unpack the sample
+    edges, lines, corners = sample
+    if lines is None or len(lines) < 2 or len(corners) < 4:
+        # Not enough information to estimate a model
+        return None
+
+    # Use the existing estimate_room_geometry function
+    geometry = estimate_room_geometry(lines, corners)
+
+    # Create and return a RoomModel
+    return RoomModel(geometry, np.zeros(1), np.ones(1))
+
+
+def model_error(feature, model, camera_model):
+    edges, lines, corners = feature
+    if lines is None or len(lines) < 2:
+        return float('inf')  # Return a large error if we don't have enough information
+
+    # Project the model's corners using the camera model
+    projected_corners = camera_model.project(model.geometry[:3])
+
+    # Compare the projected corners with the actual corners
+    error = np.mean(np.min(np.linalg.norm(projected_corners[:, None] - corners[None, :], axis=2), axis=1))
+
+    return error
+
+
+def refine_model(model, inliers, camera_model):
+    # Extract all corners and lines from inliers
+    all_corners = []
+    all_lines = []
+    for edges, lines, corners in inliers:
+        if corners is not None and len(corners) > 0:
+            all_corners.extend(corners)
+        if lines is not None and len(lines) > 0:
+            all_lines.extend(lines)
+
+    all_corners = np.array(all_corners)
+    all_lines = np.array(all_lines)
+
+    # Estimate room geometry using all inlier features
+    refined_geometry = estimate_room_geometry(all_lines, all_corners)
+
+    # Project 3D room corners to 2D using the camera model
+    room_corners_3d = np.array([
+        [0, 0, 0],
+        [refined_geometry[0], 0, 0],
+        [refined_geometry[0], refined_geometry[1], 0],
+        [0, refined_geometry[1], 0],
+        [0, 0, refined_geometry[2]],
+        [refined_geometry[0], 0, refined_geometry[2]],
+        [refined_geometry[0], refined_geometry[1], refined_geometry[2]],
+        [0, refined_geometry[1], refined_geometry[2]]
+    ])
+    projected_corners = camera_model.project(room_corners_3d)
+
+    # Optimize room dimensions to minimize reprojection error
+    def objective(params):
+        width, length, height = params
+        room_corners = np.array([
+            [0, 0, 0],
+            [width, 0, 0],
+            [width, length, 0],
+            [0, length, 0],
+            [0, 0, height],
+            [width, 0, height],
+            [width, length, height],
+            [0, length, height]
+        ])
+        projected = camera_model.project(room_corners)
+        error = np.sum((projected - projected_corners) ** 2)
+        return error
+
+    result = minimize(objective, refined_geometry[:3], method='Powell')
+    optimized_geometry = np.concatenate([result.x, refined_geometry[3:]])
+
+    # Update pan angles and zoom values based on inliers
+    # (This is a placeholder - you might want to implement a more sophisticated method)
+    pan_angles = model.pan_angles  # For now, keep the original pan angles
+    zoom_values = model.zoom_values  # For now, keep the original zoom values
+
+    return RoomModel(optimized_geometry, pan_angles, zoom_values)
+
+
+def ransac_room_estimation(features, camera_model, num_iterations=5000, threshold=0.1):
+    best_model = None
+    best_inliers = []
+
+    print(f"Starting RANSAC with {num_iterations} iterations")
+    start_time = time.time()
+
+    for i in range(num_iterations):
+        sample = random_sample(features, 1)[0]  # Take one complete feature set
+        model = estimate_model(sample, camera_model)
+
+        if model is None:
+            continue  # Skip this iteration if we couldn't estimate a model
+
+        inliers = [f for f in features if model_error(f, model, camera_model) < threshold]
+
+        if len(inliers) > len(best_inliers):
+            best_model = model
+            best_inliers = inliers
+
+        if i % 100 == 0:  # Print every 100 iterations
+            elapsed_time = time.time() - start_time
+            print(f"RANSAC Iteration {i}: Best inliers = {len(best_inliers)}, Time: {elapsed_time:.2f}s")
+
+    if best_model is None:
+        print("RANSAC failed to find a valid model")
+        return None, []
+
+    print(f"RANSAC completed. Best model has {len(best_inliers)} inliers")
+
+    refined_model = refine_model(best_model, best_inliers)
+    return refined_model, best_inliers
+
+
+def estimate_initial_model(features):
+    edges, lines, corners = features[0]
+    geometry = estimate_room_geometry(lines, corners)
+    return RoomModel(geometry, np.zeros(1), np.ones(1))
+
+
+def refine_model(initial_model, features):
+    refined_geometry = np.zeros_like(initial_model.geometry)
+    for edges, lines, corners in features:
+        geometry = estimate_room_geometry(lines, corners)
+        refined_geometry += geometry
+    refined_geometry /= len(features)
+    return RoomModel(refined_geometry, initial_model.pan_angles, initial_model.zoom_values)
+
+
+def hierarchical_optimization(frames):
+    print("Starting hierarchical optimization")
+
+    print("Coarse optimization")
+    coarse_features = [extract_features(frame) for frame in frames[::10]]
+    coarse_model = estimate_initial_model(coarse_features)
+    print(f"Coarse model geometry: {coarse_model.geometry}")
+
+    print("Medium optimization")
+    medium_features = [extract_features(frame) for frame in frames[::5]]
+    medium_model = refine_model(coarse_model, medium_features)
+    print(f"Medium model geometry: {medium_model.geometry}")
+
+    print("Fine optimization")
+    fine_features = [extract_features(frame) for frame in frames]
+    fine_model = refine_model(medium_model, fine_features)
+    print(f"Fine model geometry: {fine_model.geometry}")
+
+    return fine_model
+
+
+def reconstruct_scene(frames):
+    print("Starting scene reconstruction")
+    all_features = [extract_features(frame) for frame in frames]
+    print(f"Extracted features from {len(frames)} frames")
+
+    height, width = frames[0].shape[:2]
+    camera_model = CameraModel(
+        focal_length=(width, width),
+        principal_point=(width / 2, height / 2),
+        distortion_coeffs=np.zeros(5)
+    )
+
+    print("Starting hierarchical optimization")
+    room_model = hierarchical_optimization(frames)
+
+    # Dummy 2D and 3D points for camera optimization
+    points_2d = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=float)
+    points_3d = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float)
+    camera_model.optimize_params(points_2d, points_3d)
+
+    print("Starting RANSAC room estimation")
+    final_model, inliers = ransac_room_estimation(all_features, camera_model, num_iterations=5000)
+
+    if final_model is None:
+        print("RANSAC failed. Using the result from hierarchical optimization.")
+        final_model = room_model
+
+    room_geometry = final_model.geometry
+    camera_params = camera_model.get_params()
+    pan_angles = final_model.pan_angles
+    zoom_values = final_model.zoom_values
+
+    print("Scene reconstruction completed")
+    return room_geometry, camera_params, pan_angles, zoom_values
+
+
+def process_video(video_path):
+    print(f"Processing video: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+    cap.release()
+    print(f"Loaded {len(frames)} frames from video")
+
+    room_geometry, camera_params, pan_angles, zoom_values = reconstruct_scene(frames)
+    return room_geometry, camera_params, pan_angles, zoom_values
 
 
 # Main execution
-video_path = "/home/john/Downloads/carlos-aline-spin-cam2.mp4"
-room_geometry, camera_params, pan_angles, zoom_values = process_video(video_path)
-print("Room Geometry:", room_geometry)
-print("Camera Parameters:", camera_params)
-print("Pan Angles:", pan_angles)
-print("Zoom Values:", zoom_values)
+if __name__ == "__main__":
+    video_path = "/home/john/Downloads/carlos-aline-spin-cam2.mp4"
+    print("Starting room reconstruction from video")
+    room_geometry, camera_params, pan_angles, zoom_values = process_video(video_path)
+    print("\nFinal Results:")
+    print("Room Geometry:", room_geometry)
+    print("Camera Parameters:", camera_params)
+    print("Pan Angles:", pan_angles)
+    print("Zoom Values:", zoom_values)
+    print("Room reconstruction completed")
