@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 from scipy.optimize import minimize
 from sklearn.cluster import KMeans
 from filterpy.kalman import KalmanFilter
@@ -25,7 +26,11 @@ def reconstruct_scene(frames):
     initial_pan = np.zeros(len(frames))
     initial_zoom = np.ones(len(frames))
 
+    iteration_count = 0
+    start_time = time.time()
+
     def objective_function(params):
+        nonlocal iteration_count
         room_params = params[:6]  # [width, length, height, x, y, z]
         camera_params = params[6:13]  # [fx, fy, cx, cy, cam_x, cam_y, cam_z]
         pan_angles = params[13:13 + len(frames)]
@@ -40,19 +45,56 @@ def reconstruct_scene(frames):
         error += 0.1 * np.sum(np.diff(pan_angles) ** 2)  # Smoothness of pan angles
         error += 10 * np.sum(np.diff(zoom_values) ** 2)  # Encourage step-like zoom function
 
+        # Add room proportion constraints
+        width, length, height = room_params[:3]
+        error += 1000 * max(0, width / length - 3)  # Width should not be more than 3 times the length
+        error += 1000 * max(0, length / width - 3)  # Length should not be more than 3 times the width
+        error += 1000 * max(0, height / width - 3)  # Height should not be more than 3 times the width
+        error += 1000 * max(0, height / length - 3)  # Height should not be more than 3 times the length
+
+        iteration_count += 1
+        elapsed_time = time.time() - start_time
+        print(f"Iteration {iteration_count}: Error = {error:.2f}, Time: {elapsed_time:.2f}s")
+
         return error
 
     initial_params = np.concatenate([initial_geometry, initial_camera, initial_pan, initial_zoom])
 
-    # Add constraints
+    # Add constraints (same as before)
     constraints = [
         {'type': 'ineq', 'fun': lambda x: x[12] - 0},  # cam_z >= 0
         {'type': 'ineq', 'fun': lambda x: 2 - x[12]},  # cam_z <= 2
+        {'type': 'ineq', 'fun': lambda x: x[0] - 1},  # width >= 1 meter
+        {'type': 'ineq', 'fun': lambda x: x[1] - 1},  # length >= 1 meter
+        {'type': 'ineq', 'fun': lambda x: x[2] - 2},  # height >= 2 meters
+        {'type': 'ineq', 'fun': lambda x: 10 - x[0]},  # width <= 10 meters
+        {'type': 'ineq', 'fun': lambda x: 10 - x[1]},  # length <= 10 meters
+        {'type': 'ineq', 'fun': lambda x: 5 - x[2]},  # height <= 5 meters
     ]
 
-    result = minimize(objective_function, initial_params, method='SLSQP', constraints=constraints)
+    best_result = None
+    best_error = float('inf')
 
-    optimized_params = result.x
+    for init_attempt in range(5):  # Multiple initializations
+        print(f"\nInitialization attempt {init_attempt + 1}")
+        iteration_count = 0
+        start_time = time.time()
+
+        result = minimize(objective_function, initial_params, method='SLSQP', constraints=constraints,
+                          options={'maxiter': 1000})
+
+        if result.fun < best_error:
+            best_result = result
+            best_error = result.fun
+
+        print(f"Attempt {init_attempt + 1} finished. Final error: {result.fun:.2f}")
+
+        # Perturb initial params for next iteration
+        initial_params += np.random.normal(0, 0.1, len(initial_params))
+
+    print(f"\nBest result achieved with error: {best_error:.2f}")
+
+    optimized_params = best_result.x
     room_geometry = optimized_params[:6]
     camera_params = optimized_params[6:13]
     pan_angles = optimized_params[13:13 + len(frames)]
@@ -62,8 +104,12 @@ def reconstruct_scene(frames):
     pan_angles = smooth_pan_angles(pan_angles)
     zoom_values = smooth_zoom_values(zoom_values)
 
-    return room_geometry, camera_params, pan_angles, zoom_values
+    # Convert room dimensions to meters (assuming the camera height is in meters)
+    scale_factor = camera_params[6] / 1.0  # Assuming camera is at 1 meter height
+    room_geometry[:3] *= scale_factor
+    room_geometry[3:] *= scale_factor
 
+    return room_geometry, camera_params, pan_angles, zoom_values
 
 def estimate_initial_geometry(frame):
     edges = cv2.Canny(frame, 50, 150)
@@ -123,17 +169,20 @@ def compute_error(frame, projected_geometry):
     height, width = frame.shape
     mask = np.zeros((height, width), dtype=np.uint8)
 
+    def to_int_tuple(point):
+        return tuple(map(int, map(round, point)))
+
     # Draw projected geometry on mask
     for i in range(4):
-        pt1 = tuple(map(int, projected_geometry[i]))
-        pt2 = tuple(map(int, projected_geometry[(i + 1) % 4]))
+        pt1 = to_int_tuple(projected_geometry[i])
+        pt2 = to_int_tuple(projected_geometry[(i + 1) % 4])
+        pt3 = to_int_tuple(projected_geometry[i + 4])
         cv2.line(mask, pt1, pt2, 255, 2)
-        pt3 = tuple(map(int, projected_geometry[i + 4]))
         cv2.line(mask, pt1, pt3, 255, 2)
 
     for i in range(4, 8):
-        pt1 = tuple(map(int, projected_geometry[i]))
-        pt2 = tuple(map(int, projected_geometry[(i - 3) % 4 + 4]))
+        pt1 = to_int_tuple(projected_geometry[i])
+        pt2 = to_int_tuple(projected_geometry[(i - 3) % 4 + 4])
         cv2.line(mask, pt1, pt2, 255, 2)
 
     # Compute error
@@ -218,7 +267,7 @@ def smooth_zoom_values(zoom_values):
 
 
 # Main execution
-video_path = "/home/john/Downloads/carlos-aline-spin-cam1.mp4"
+video_path = "/home/john/Downloads/carlos-aline-spin-cam2.mp4"
 room_geometry, camera_params, pan_angles, zoom_values = process_video(video_path)
 print("Room Geometry:", room_geometry)
 print("Camera Parameters:", camera_params)
