@@ -4,7 +4,7 @@ import math
 import os
 
 
-def detect_lines_and_roll(video_path, output_dir):
+def detect_lines_and_axes(video_path, output_dir):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -40,7 +40,7 @@ def detect_lines_and_roll(video_path, output_dir):
         upper_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         upper_mask[pad_y:height // 2, pad_x:width - pad_x] = 255
 
-        # Lower half mask (for Hough lines)
+        # Lower half mask (for floor lines)
         lower_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         lower_mask[height // 2:height - pad_y, pad_x:width - pad_x] = 255
 
@@ -76,26 +76,44 @@ def detect_lines_and_roll(video_path, output_dir):
         for x1, y1, x2, y2, _ in vertical_lines:
             cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        # Lower half processing (Hough lines)
+        # Lower half processing (floor lines)
         lower_edges = cv2.bitwise_and(edges, edges, mask=lower_mask)
         lower_lines = cv2.HoughLinesP(lower_edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=10)
 
-        # Draw Hough lines (red) in lower half
+        floor_lines = []
         if lower_lines is not None:
             for line in lower_lines:
                 x1, y1, x2, y2 = line[0]
+                angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180
+                floor_lines.append((x1, y1, x2, y2, angle))
                 cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-        # Display roll angle
-        cv2.putText(frame, f"Roll: {roll_angle:.2f} degrees", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        # Determine predominant x and y axes
+        if floor_lines:
+            angles = np.array([angle for _, _, _, _, angle in floor_lines])
+            x_axis_angle = np.median(angles[np.abs(angles) < 45])
+            y_axis_angle = np.median(angles[np.abs(angles - 90) < 45])
+        else:
+            x_axis_angle, y_axis_angle = 0, 90
 
-        # Draw horizontal line to indicate roll
+        # Draw predominant x and y axes
         center_x, center_y = width // 2, height // 2
         line_length = 100
-        end_x = int(center_x + line_length * math.cos(math.radians(roll_angle)))
-        end_y = int(center_y - line_length * math.sin(math.radians(roll_angle)))
+
+        # X-axis (blue)
+        end_x = int(center_x + line_length * math.cos(math.radians(x_axis_angle)))
+        end_y = int(center_y + line_length * math.sin(math.radians(x_axis_angle)))
         cv2.line(frame, (center_x, center_y), (end_x, end_y), (255, 0, 0), 2)
+
+        # Y-axis (yellow)
+        end_x = int(center_x + line_length * math.cos(math.radians(y_axis_angle)))
+        end_y = int(center_y + line_length * math.sin(math.radians(y_axis_angle)))
+        cv2.line(frame, (center_x, center_y), (end_x, end_y), (0, 255, 255), 2)
+
+        # Display roll angle and axes angles
+        cv2.putText(frame, f"Roll: {roll_angle:.2f} deg", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"X-axis: {x_axis_angle:.2f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        cv2.putText(frame, f"Y-axis: {y_axis_angle:.2f} deg", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # Draw padding boundary (optional, for visualization)
         cv2.rectangle(frame, (pad_x, pad_y), (width - pad_x, height - pad_y), (255, 255, 0), 2)
@@ -121,4 +139,4 @@ def detect_lines_and_roll(video_path, output_dir):
 video_path = '/home/john/Downloads/larissa-kadu-counter-demo/01-Demo-Ali.mp4'  # Replace with your actual video path
 output_dir = '/home/john/Desktop/out'  # Replace with your desired output directory
 
-detect_lines_and_roll(video_path, output_dir)
+detect_lines_and_axes(video_path, output_dir)
