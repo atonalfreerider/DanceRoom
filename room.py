@@ -31,18 +31,34 @@ def cluster_lines(lines, n_clusters=4):
     return [cluster for cluster in clustered_lines if cluster]  # Remove empty clusters
 
 
-def detect_lines(edges, frame_height):
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    return edges
+
+
+def detect_lines(edges, frame_height, frame_width):
     # Separate detection for lower and upper half of the frame
     lower_half = edges[frame_height // 2:, :]
     upper_half = edges[:frame_height // 2, :]
 
+    # Parameters for Hough Line Transform
+    rho = 1
+    theta = np.pi / 180
+    threshold = 50
+    min_line_length = 50
+    max_line_gap = 10
+
     # Detect lines in lower half (emphasize horizontal and diagonal)
-    lower_lines = cv2.HoughLinesP(lower_half, 1, np.pi / 180, threshold=50,
-                                  minLineLength=50, maxLineGap=20)
+    lower_lines = cv2.HoughLinesP(lower_half, rho, theta, threshold,
+                                  minLineLength=min_line_length,
+                                  maxLineGap=max_line_gap)
 
     # Detect lines in upper half (emphasize vertical)
-    upper_lines = cv2.HoughLinesP(upper_half, 1, np.pi / 180, threshold=50,
-                                  minLineLength=30, maxLineGap=10)
+    upper_lines = cv2.HoughLinesP(upper_half, rho, theta, threshold,
+                                  minLineLength=min_line_length,
+                                  maxLineGap=max_line_gap)
 
     # Adjust y-coordinates for upper lines
     if upper_lines is not None:
@@ -50,14 +66,18 @@ def detect_lines(edges, frame_height):
         upper_lines[:, :, 3] += frame_height // 2
 
     # Combine lower and upper lines
-    all_lines = np.vstack((lower_lines, upper_lines)) if upper_lines is not None else lower_lines
+    all_lines = np.vstack((lower_lines,
+                           upper_lines)) if upper_lines is not None and lower_lines is not None else lower_lines or upper_lines
 
     return all_lines
 
 
-def classify_lines(lines, frame_height):
+def classify_lines(lines, frame_height, frame_width):
     floor_lines = []
     wall_lines = []
+    if lines is None:
+        return floor_lines, wall_lines
+
     for line in lines:
         x1, y1, x2, y2 = line[0]
         dx = x2 - x1
@@ -65,30 +85,22 @@ def classify_lines(lines, frame_height):
         angle = np.abs(np.arctan2(dy, dx) * 180 / np.pi)
 
         # Classify based on angle and position
-        if y1 > frame_height / 2 and y2 > frame_height / 2:
-            if angle < 45 or angle > 135:  # More horizontal
+        if y1 > frame_height * 0.6 and y2 > frame_height * 0.6:  # Lower 40% of the frame
+            if angle < 30 or angle > 150:  # More horizontal
                 floor_lines.append(line)
-            elif 45 <= angle <= 135:  # Diagonal
-                floor_lines.append(line)
-        else:
-            if 75 < angle < 105:  # More vertical
+        elif y1 < frame_height * 0.4 and y2 < frame_height * 0.4:  # Upper 40% of the frame
+            if 60 < angle < 120:  # More vertical
                 wall_lines.append(line)
-            else:
-                floor_lines.append(line)
 
     return floor_lines, wall_lines
 
 
-def find_longest_lines(lines, n_longest=10):
-    if lines is None or len(lines) == 0:
-        return []
-
-    # Sort lines by length
-    sorted_lines = sorted(lines, key=lambda x: np.sqrt((x[0][2] - x[0][0]) ** 2 + (x[0][3] - x[0][1]) ** 2),
-                          reverse=True)
-
-    # Return the n longest lines
-    return sorted_lines[:n_longest]
+def draw_lines(frame, lines, color):
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+    return frame
 
 
 def ransac_vanishing_point(lines, num_iterations=100, threshold=10):
@@ -214,15 +226,6 @@ def visualize_frame(frame, floor_plane, camera_pose):
 
     return frame
 
-
-def draw_hough_lines(frame, lines):
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-    return frame
-
-
 def process_video(video_path, output_dir):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -251,18 +254,17 @@ def process_video(video_path, output_dir):
             break
 
         edges = preprocess_frame(frame)
-        lines = detect_lines(edges, frame.shape[0])
+        lines = detect_lines(edges, frame.shape[0], frame.shape[1])
 
-        # Find longest lines
-        longest_lines = find_longest_lines(lines, n_longest=20)
+        floor_lines, wall_lines = classify_lines(lines, frame.shape[0], frame.shape[1])
 
-        # Draw Hough Lines
-        frame_with_lines = draw_hough_lines(frame.copy(), longest_lines)
+        # Draw lines
+        frame_with_lines = frame.copy()
+        frame_with_lines = draw_lines(frame_with_lines, floor_lines, (0, 255, 0))  # Green for floor
+        frame_with_lines = draw_lines(frame_with_lines, wall_lines, (0, 0, 255))  # Red for walls
 
-        # Save frame with Hough Lines
-        cv2.imwrite(os.path.join(output_dir, f"frame_{frame_count:04d}_hough_lines.jpg"), frame_with_lines)
-
-        floor_lines, wall_lines = classify_lines(longest_lines, frame.shape[0])
+        # Save frame with lines
+        cv2.imwrite(os.path.join(output_dir, f"frame_{frame_count:04d}_lines.jpg"), frame_with_lines)
 
         floor_plane = estimate_floor_plane(floor_lines, wall_lines, frame.shape)
         if floor_plane is not None:
