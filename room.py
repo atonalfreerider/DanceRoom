@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
 import time
+import os
+import json
 from scipy.optimize import minimize
 from sklearn.cluster import DBSCAN
-
 
 class CameraModel:
     def __init__(self, focal_length, principal_point, distortion_coeffs):
@@ -281,38 +282,42 @@ def refine_model(model, inliers, camera_model):
     return RoomModel(optimized_geometry, pan_angles, zoom_values)
 
 
-def ransac_room_estimation(features, camera_model, num_iterations=5000, threshold=0.1):
-    best_model = None
-    best_inliers = []
+def ransac_room_estimation(features, camera_model, num_iterations=5000, threshold=0.1, max_attempts=3):
+    for attempt in range(max_attempts):
+        best_model = None
+        best_inliers = []
 
-    print(f"Starting RANSAC with {num_iterations} iterations")
-    start_time = time.time()
+        print(f"Starting RANSAC attempt {attempt + 1} with {num_iterations} iterations")
+        start_time = time.time()
 
-    for i in range(num_iterations):
-        sample = random_sample(features, 1)[0]  # Take one complete feature set
-        model = estimate_model(sample, camera_model)
+        for i in range(num_iterations):
+            sample = random_sample(features, 1)[0]  # Take one complete feature set
+            model = estimate_model(sample, camera_model)
 
-        if model is None:
-            continue  # Skip this iteration if we couldn't estimate a model
+            if model is None:
+                continue  # Skip this iteration if we couldn't estimate a model
 
-        inliers = [f for f in features if model_error(f, model, camera_model) < threshold]
+            inliers = [f for f in features if model_error(f, model, camera_model) < threshold]
 
-        if len(inliers) > len(best_inliers):
-            best_model = model
-            best_inliers = inliers
+            if len(inliers) > len(best_inliers):
+                best_model = model
+                best_inliers = inliers
 
-        if i % 100 == 0:  # Print every 100 iterations
-            elapsed_time = time.time() - start_time
-            print(f"RANSAC Iteration {i}: Best inliers = {len(best_inliers)}, Time: {elapsed_time:.2f}s")
+            if i % 100 == 0:  # Print every 100 iterations
+                elapsed_time = time.time() - start_time
+                print(f"RANSAC Iteration {i}: Best inliers = {len(best_inliers)}, Time: {elapsed_time:.2f}s")
 
-    if best_model is None:
-        print("RANSAC failed to find a valid model")
-        return None, []
+        if best_model is not None:
+            print(f"RANSAC completed. Best model has {len(best_inliers)} inliers")
+            refined_model = refine_model(best_model, best_inliers, camera_model)
+            return refined_model, best_inliers
 
-    print(f"RANSAC completed. Best model has {len(best_inliers)} inliers")
+        print(f"RANSAC attempt {attempt + 1} failed. Adjusting parameters and trying again.")
+        threshold *= 1.5  # Increase threshold for next attempt
+        num_iterations = int(num_iterations * 1.5)  # Increase number of iterations for next attempt
 
-    refined_model = refine_model(best_model, best_inliers)
-    return refined_model, best_inliers
+    print("All RANSAC attempts failed to find a valid model")
+    return None, []
 
 
 def estimate_initial_model(features):
@@ -387,30 +392,102 @@ def reconstruct_scene(frames):
     return room_geometry, camera_params, pan_angles, zoom_values
 
 
-def process_video(video_path):
+def draw_features(frame, edges, lines, corners, vanishing_points):
+    result = frame.copy()
+
+    # Draw edges
+    result[edges != 0] = [0, 255, 0]
+
+    # Draw lines
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(result, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+    # Draw corners
+    for corner in corners:
+        x, y = corner.ravel()
+        cv2.circle(result, (x, y), 3, (255, 0, 0), -1)
+
+    # Draw vanishing points
+    for vp in vanishing_points:
+        x, y = int(vp[0]), int(vp[1])
+        cv2.circle(result, (x, y), 10, (255, 255, 0), -1)
+
+    return result
+
+
+def process_video(video_path, output_path):
     print(f"Processing video: {video_path}")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_path, exist_ok=True)
+
     cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
     frames = []
+    frame_count = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        frames.append(frame)
+        if frame_count % int(fps) == 0:  # Sample one frame per second
+            frames.append(frame)
+        frame_count += 1
+
     cap.release()
     print(f"Loaded {len(frames)} frames from video")
 
+    all_features = []
+    for i, frame in enumerate(frames):
+        edges, lines, corners = extract_features(frame)
+        all_features.append((edges, lines, corners))
+
+        # Estimate room geometry for visualization
+        if lines is not None and len(lines) >= 2:
+            orientations = np.array([np.arctan2(x2 - x1, y2 - y1) for (x1, y1, x2, y2) in lines[:, 0]])
+            orientation_clusters = cluster_orientations(orientations)
+            dominant_orientations = find_dominant_orientations(orientation_clusters)
+            grouped_lines = group_lines_by_orientation(lines, dominant_orientations)
+            vanishing_points = estimate_vanishing_points(grouped_lines)
+        else:
+            vanishing_points = []
+
+        # Draw features on frame
+        result_frame = draw_features(frame, edges, lines, corners, vanishing_points)
+
+        # Save the frame with drawn features
+        cv2.imwrite(os.path.join(output_path, f"frame_{i:04d}.jpg"), result_frame)
+
     room_geometry, camera_params, pan_angles, zoom_values = reconstruct_scene(frames)
+
+    # Save results to JSON files
+    results = {
+        "room_geometry": room_geometry.tolist(),
+        "camera_params": camera_params.tolist(),
+        "pan_angles": pan_angles.tolist(),
+        "zoom_values": zoom_values.tolist()
+    }
+
+    with open(os.path.join(output_path, "results.json"), "w") as f:
+        json.dump(results, f, indent=4)
+
     return room_geometry, camera_params, pan_angles, zoom_values
 
 
 # Main execution
 if __name__ == "__main__":
     video_path = "/home/john/Downloads/carlos-aline-spin-cam2.mp4"
+    output_path = "/home/john/Desktop/room_reconstruction_output"
+
     print("Starting room reconstruction from video")
-    room_geometry, camera_params, pan_angles, zoom_values = process_video(video_path)
+    room_geometry, camera_params, pan_angles, zoom_values = process_video(video_path, output_path)
+
     print("\nFinal Results:")
     print("Room Geometry:", room_geometry)
     print("Camera Parameters:", camera_params)
     print("Pan Angles:", pan_angles)
     print("Zoom Values:", zoom_values)
     print("Room reconstruction completed")
+    print(f"Results and visualizations saved to {output_path}")
