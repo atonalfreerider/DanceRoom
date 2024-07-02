@@ -1,134 +1,12 @@
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 import os
+import random
 
 
-def estimate_camera_params(video_path):
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
-
-    # Read the first frame
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to read video")
-        return None
-
-    # Convert frame to grayscale
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # Detect corners
-    corners = cv2.goodFeaturesToTrack(gray, 100, 0.01, 10)
-    corners = np.int32(corners)  # Changed from np.int0 to np.int32
-
-    # Assume the four corners of the room are among the detected corners
-    # For simplicity, we'll just use the extreme corners
-    x_sorted = sorted(corners, key=lambda x: x[0][0])
-    y_sorted = sorted(corners, key=lambda x: x[0][1])
-
-    top_left = x_sorted[0][0]
-    top_right = x_sorted[-1][0]
-    bottom_left = y_sorted[-1][0]
-    bottom_right = [x_sorted[-1][0][0], y_sorted[-1][0][1]]
-
-    # Define 3D points of a rectangular room (assuming dimensions)
-    room_width = 5.0  # meters
-    room_length = 8.0  # meters
-    object_points = np.array([
-        (0, 0, 0),
-        (room_width, 0, 0),
-        (0, room_length, 0),
-        (room_width, room_length, 0)
-    ], dtype=np.float32)
-
-    # Define corresponding 2D points
-    image_points = np.array([
-        top_left,
-        top_right,
-        bottom_left,
-        bottom_right
-    ], dtype=np.float32)
-
-    # Camera matrix (assuming some values)
-    focal_length = frame.shape[1]
-    center = (frame.shape[1] / 2, frame.shape[0] / 2)
-    camera_matrix = np.array(
-        [[focal_length, 0, center[0]],
-         [0, focal_length, center[1]],
-         [0, 0, 1]], dtype=np.float32
-    )
-
-    # Assume no lens distortion
-    dist_coeffs = np.zeros((4, 1))
-
-    # Solve PnP
-    success, rotation_vector, translation_vector = cv2.solvePnP(object_points, image_points, camera_matrix, dist_coeffs)
-
-    # Convert rotation vector to rotation matrix
-    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-
-    # Extract pan, tilt, roll
-    pan = np.arctan2(rotation_matrix[0][2], rotation_matrix[2][2]) * 180 / np.pi
-    tilt = np.arcsin(-rotation_matrix[1][2]) * 180 / np.pi
-    roll = np.arctan2(rotation_matrix[1][0], rotation_matrix[1][1]) * 180 / np.pi
-
-    # Estimate zoom (field of view)
-    fov = 2 * np.arctan(frame.shape[1] / (2 * focal_length)) * 180 / np.pi
-
-    cap.release()
-
-    return {
-        'pan': pan,
-        'tilt': tilt,
-        'roll': roll,
-        'zoom': fov,
-        'rotation_matrix': rotation_matrix,
-        'translation_vector': translation_vector,
-        'camera_matrix': camera_matrix
-    }
-
-
-def draw_floor_grid(frame, camera_params):
-    # Define grid points on the floor
-    x, y = np.meshgrid(range(0, 6), range(0, 9))
-    z = np.zeros_like(x)
-    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
-
-    # Project 3D points to 2D image plane
-    image_points, _ = cv2.projectPoints(
-        points.astype(np.float32),
-        camera_params['rotation_matrix'],
-        camera_params['translation_vector'],
-        camera_params['camera_matrix'],
-        None
-    )
-
-    # Reshape image_points for easier indexing
-    image_points = image_points.reshape(-1, 2)
-
-    # Draw grid lines
-    for i in range(6):
-        pt1 = tuple(map(int, image_points[i * 9]))
-        pt2 = tuple(map(int, image_points[i * 9 + 8]))
-        cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
-
-    for i in range(9):
-        pt1 = tuple(map(int, image_points[i]))
-        pt2 = tuple(map(int, image_points[i + 45]))
-        cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
-
-    return frame
-
-
-def process_video(video_path, output_folder):
-    # Estimate camera parameters
-    camera_params = estimate_camera_params(video_path)
-    if camera_params is None:
-        return
-
-    # Create output folder if it doesn't exist
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Open the video file again
+def extract_frames(video_path, interval):
+    frames = []
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
 
@@ -136,27 +14,220 @@ def process_video(video_path, output_folder):
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Draw floor grid
-        frame_with_grid = draw_floor_grid(frame.copy(), camera_params)
-
-        # Save the frame
-        output_path = os.path.join(output_folder, f"frame_{frame_count:04d}.jpg")
-        cv2.imwrite(output_path, frame_with_grid)
-
+        if frame_count % interval == 0:
+            frames.append(frame)
         frame_count += 1
 
     cap.release()
-
-    print(f"Camera parameters:")
-    print(f"Pan: {camera_params['pan']:.2f} degrees")
-    print(f"Tilt: {camera_params['tilt']:.2f} degrees")
-    print(f"Roll: {camera_params['roll']:.2f} degrees")
-    print(f"Zoom (FOV): {camera_params['zoom']:.2f} degrees")
-    print(f"Processed {frame_count} frames")
+    return frames
 
 
-# Usage
-video_path = "/home/john/Downloads/carlos-aline-spin-cam1.mp4"
-output_folder = "/home/john/Desktop/out"
-process_video(video_path, output_folder)
+def detect_floor_plane(frame):
+    height, width = frame.shape[:2]
+    lower_half = frame[height // 2:, :]
+
+    gray = cv2.cvtColor(lower_half, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=100)
+
+    if lines is None:
+        return None
+
+    horizontal_lines = []
+    for line in lines:
+        rho, theta = line[0]
+        if abs(theta - np.pi / 2) < np.pi / 18:  # Within 10 degrees of horizontal
+            horizontal_lines.append((rho, theta))
+
+    if len(horizontal_lines) < 2:
+        return None
+
+    # Use RANSAC to fit a plane (in this case, just a line) to the horizontal lines
+    best_model = None
+    best_inliers = 0
+    for _ in range(100):  # RANSAC iterations
+        sample = random.sample(horizontal_lines, 2)
+        try:
+            model = np.polyfit([s[0] for s in sample], [s[1] for s in sample], 1)
+            inliers = sum(abs(model[0] * line[0] + model[1] - line[1]) < 0.1 for line in horizontal_lines)
+            if inliers > best_inliers:
+                best_model = model
+                best_inliers = inliers
+        except np.RankWarning:
+            continue  # Skip this iteration if polyfit is poorly conditioned
+
+    return best_model
+
+def estimate_camera_pose(floor_model, estimated_intrinsics):
+    if floor_model is None:
+        return None
+
+    # Assuming the floor plane is y = ax + b in the image
+    a, b = floor_model
+
+    # Convert to 3D plane normal
+    normal = np.array([a, -1, 0])
+    normal /= np.linalg.norm(normal)
+
+    # Assuming the camera is looking down at the floor, we can estimate its orientation
+    camera_up = np.array([0, 1, 0])
+    camera_forward = np.cross(normal, camera_up)
+    camera_right = np.cross(camera_forward, camera_up)
+
+    rotation_matrix = np.column_stack((camera_right, camera_up, camera_forward))
+
+    # Convert rotation matrix to quaternion
+    r = R.from_matrix(rotation_matrix)
+    quaternion = r.as_quat()
+
+    # Estimate translation (this is a simplification and may need refinement)
+    translation = np.array([0, b, 0])
+
+    return (quaternion, translation)
+
+
+def track_camera_motion(prev_frame, curr_frame, prev_pose):
+    if prev_pose is None:
+        return None
+
+    # Convert frames to grayscale
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+
+    # Calculate optical flow
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+    # Calculate the average flow vector
+    avg_flow = np.mean(flow, axis=(0, 1))
+
+    # Update the camera pose based on the average flow
+    prev_quat, prev_trans = prev_pose
+
+    # Simplified update (this needs refinement for accurate results)
+    updated_trans = prev_trans + np.array([avg_flow[0], 0, avg_flow[1]])
+
+    return (prev_quat, updated_trans)
+
+
+def detect_zoom_change(prev_frame, curr_frame):
+    # Convert frames to grayscale
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+
+    # Detect features in both frames
+    orb = cv2.ORB_create()
+    prev_kp, prev_des = orb.detectAndCompute(prev_gray, None)
+    curr_kp, curr_des = orb.detectAndCompute(curr_gray, None)
+
+    # Match features
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(prev_des, curr_des)
+
+    # Calculate average distance between matched features
+    avg_dist = np.mean([m.distance for m in matches])
+
+    # If average distance decreased, zoom in; if increased, zoom out
+    zoom_factor = 1.0
+    if avg_dist < 32:  # Threshold may need adjustment
+        zoom_factor = 32 / avg_dist
+    elif avg_dist > 32:
+        zoom_factor = avg_dist / 32
+
+    return zoom_factor
+
+
+def draw_floor_grid(frame, floor_model, camera_pose, intrinsics):
+    height, width = frame.shape[:2]
+
+    if floor_model is None or camera_pose is None:
+        return frame
+
+    # Create a grid in 3D space
+    grid_size = 10
+    grid_step = 1
+    x, z = np.meshgrid(range(-grid_size, grid_size + 1, grid_step), range(-grid_size, grid_size + 1, grid_step))
+    y = np.zeros_like(x)
+
+    # Create homogeneous coordinates
+    points_3d = np.vstack((x.ravel(), y.ravel(), z.ravel(), np.ones_like(x.ravel())))
+
+    # Camera extrinsics
+    quat, trans = camera_pose
+    rotation_matrix = R.from_quat(quat).as_matrix()
+    extrinsics = np.hstack((rotation_matrix, trans.reshape(3, 1)))
+
+    # Project 3D points to 2D
+    points_cam = extrinsics @ points_3d
+    points_2d = intrinsics @ points_cam[:3, :]
+
+    # Handle division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        points_2d = points_2d[:2] / points_2d[2]
+    points_2d = np.where(np.isfinite(points_2d), points_2d, 0)
+
+    points_2d = points_2d.T.reshape(x.shape + (2,))
+
+    # Draw the grid
+    for i in range(points_2d.shape[0]):
+        pts = points_2d[i].astype(np.int32)
+        pts = pts[np.all(pts >= 0, axis=1) & (pts[:, 0] < width) & (pts[:, 1] < height)]
+        if len(pts) > 1:
+            cv2.polylines(frame, [pts], False, (0, 255, 0), 1)
+
+    for i in range(points_2d.shape[1]):
+        pts = points_2d[:, i].astype(np.int32)
+        pts = pts[np.all(pts >= 0, axis=1) & (pts[:, 0] < width) & (pts[:, 1] < height)]
+        if len(pts) > 1:
+            cv2.polylines(frame, [pts], False, (0, 255, 0), 1)
+
+    return frame
+
+
+def main():
+    video_path = "/home/john/Downloads/larissa-kadu-counter-demo/01-Demo-Ali.mp4"
+    output_dir = "/home/john/Desktop/out"
+    os.makedirs(output_dir, exist_ok=True)
+
+    frames = extract_frames(video_path, interval=30)
+
+    height, width = frames[0].shape[:2]
+    estimated_intrinsics = np.array([[1000, 0, width / 2],
+                                     [0, 1000, height / 2],
+                                     [0, 0, 1]])
+
+    camera_poses = []
+    prev_pose = None
+
+    for i, frame in enumerate(frames):
+        floor_model = detect_floor_plane(frame)
+        camera_pose = estimate_camera_pose(floor_model, estimated_intrinsics)
+
+        if i > 0:
+            tracked_pose = track_camera_motion(frames[i - 1], frame, prev_pose)
+            if tracked_pose is not None:
+                camera_pose = tracked_pose
+
+            zoom_factor = detect_zoom_change(frames[i - 1], frame)
+            estimated_intrinsics[0, 0] *= zoom_factor
+            estimated_intrinsics[1, 1] *= zoom_factor
+
+        camera_poses.append(camera_pose)
+        prev_pose = camera_pose
+
+        # Draw floor grid and save frame
+        if camera_pose is not None:
+            frame_with_grid = draw_floor_grid(frame.copy(), floor_model, camera_pose, estimated_intrinsics)
+            quat, trans = camera_pose
+            cv2.putText(frame_with_grid, f"Rotation: {quat}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame_with_grid, f"Translation: {trans}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0),
+                        2)
+            cv2.imwrite(os.path.join(output_dir, f"frame_{i:04d}.jpg"), frame_with_grid)
+        else:
+            cv2.imwrite(os.path.join(output_dir, f"frame_{i:04d}.jpg"), frame)
+
+        print(f"Processed frame {i + 1}/{len(frames)}")
+
+
+if __name__ == "__main__":
+    main()
