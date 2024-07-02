@@ -9,17 +9,21 @@ def main():
 
     # Step 1: Segment people, create background-only video, and save masks and poses
     segmenter = PersonSegmentation(output_dir)
-    bg_video_path = os.path.join(output_dir, 'background_only.mp4')
-    segmenter.process_video(input_video, bg_video_path)
+    if not segmenter.process_video(input_video):
+        print("Error processing video. Exiting.")
+        return
 
-    # Get poses for rendering
+    # Get poses for rendering and background video path
     poses = segmenter.get_poses()
+    bg_video_path = segmenter.get_bg_video_path()
 
     # Step 2: Process background-only video for room orientation and render poses
     final_output_path = os.path.join(output_dir, 'final_output.mp4')
-    detect_lines_and_axes(bg_video_path, final_output_path, poses)
-
-    print(f"Processing complete. Final output saved to: {final_output_path}")
+    if os.path.exists(bg_video_path):
+        detect_lines_and_axes(bg_video_path, final_output_path, poses)
+        print(f"Processing complete. Final output saved to: {final_output_path}")
+    else:
+        print(f"Error: Background video not found at {bg_video_path}")
 
 if __name__ == "__main__":
     main()
