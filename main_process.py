@@ -12,9 +12,12 @@ def main():
     bg_video_path = os.path.join(output_dir, 'background_only.mp4')
     segmenter.process_video(input_video, bg_video_path)
 
-    # Step 2: Process background-only video for room orientation
+    # Get poses for rendering
+    poses = segmenter.get_poses()
+
+    # Step 2: Process background-only video for room orientation and render poses
     final_output_path = os.path.join(output_dir, 'final_output.mp4')
-    detect_lines_and_axes(bg_video_path, final_output_path)
+    detect_lines_and_axes(bg_video_path, final_output_path, poses)
 
     print(f"Processing complete. Final output saved to: {final_output_path}")
 
