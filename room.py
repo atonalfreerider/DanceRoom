@@ -29,8 +29,8 @@ def detect_lines_and_axes(video_path, output_dir):
         height, width = frame.shape[:2]
 
         # Calculate 2% padding
-        pad_x = int(width * 0.01)
-        pad_y = int(height * 0.01)
+        pad_x = int(width * 0.02)
+        pad_y = int(height * 0.02)
 
         # Create padding mask
         padding_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -52,68 +52,80 @@ def detect_lines_and_axes(video_path, output_dir):
 
         # Upper half processing (vertical lines)
         upper_edges = cv2.bitwise_and(edges, edges, mask=upper_mask)
-        upper_lines = cv2.HoughLinesP(upper_edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=10)
+        upper_lines = cv2.HoughLinesP(upper_edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
 
         vertical_lines = []
         if upper_lines is not None:
             for line in upper_lines:
                 x1, y1, x2, y2 = line[0]
-                if x1 == x2:  # Perfectly vertical line
-                    angle = 90
-                else:
-                    angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+                length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+                angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
                 if abs(angle - 90) < 20:
-                    vertical_lines.append((x1, y1, x2, y2, angle))
+                    vertical_lines.append((x1, y1, x2, y2, angle, length))
+
+        # Sort vertical lines by length and keep only the top 10
+        vertical_lines = sorted(vertical_lines, key=lambda x: x[5], reverse=True)[:10]
 
         # Calculate roll angle based on vertical lines
         if vertical_lines:
-            angles = [90 - angle for _, _, _, _, angle in vertical_lines]
+            angles = [90 - angle for _, _, _, _, angle, _ in vertical_lines]
             roll_angle = np.median(angles)
         else:
             roll_angle = 0
 
-        # Draw vertical lines (green) in upper half
-        for x1, y1, x2, y2, _ in vertical_lines:
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
         # Lower half processing (floor lines)
         lower_edges = cv2.bitwise_and(edges, edges, mask=lower_mask)
-        lower_lines = cv2.HoughLinesP(lower_edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=10)
+        lower_lines = cv2.HoughLinesP(lower_edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
 
         floor_lines = []
         if lower_lines is not None:
             for line in lower_lines:
                 x1, y1, x2, y2 = line[0]
+                length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
                 angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180
-                floor_lines.append((x1, y1, x2, y2, angle))
-                cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                floor_lines.append((x1, y1, x2, y2, angle, length))
+
+        # Sort floor lines by length and keep only the top 20
+        floor_lines = sorted(floor_lines, key=lambda x: x[5], reverse=True)[:20]
 
         # Determine predominant x and y axes
         if floor_lines:
-            angles = np.array([angle for _, _, _, _, angle in floor_lines])
+            angles = np.array([angle for _, _, _, _, angle, _ in floor_lines])
             x_axis_angle = np.median(angles[np.abs(angles) < 45])
             y_axis_angle = np.median(angles[np.abs(angles - 90) < 45])
         else:
             x_axis_angle, y_axis_angle = 0, 90
 
-        # Draw predominant x and y axes
-        center_x, center_y = width // 2, height // 2
-        line_length = 100
+        # Function to determine color based on angle
+        def get_color(angle):
+            try:
+                x_align = np.abs(np.cos(np.radians(angle - x_axis_angle)))
+                y_align = np.abs(np.cos(np.radians(angle - y_axis_angle)))
+                z_align = np.abs(np.cos(np.radians(angle - 90)))
 
-        # X-axis (blue)
-        end_x = int(center_x + line_length * math.cos(math.radians(x_axis_angle)))
-        end_y = int(center_y + line_length * math.sin(math.radians(x_axis_angle)))
-        cv2.line(frame, (center_x, center_y), (end_x, end_y), (255, 0, 0), 2)
+                r = int(255 * np.clip(x_align, 0, 1))
+                g = int(255 * np.clip(z_align, 0, 1))
+                b = int(255 * np.clip(y_align, 0, 1))
 
-        # Y-axis (yellow)
-        end_x = int(center_x + line_length * math.cos(math.radians(y_axis_angle)))
-        end_y = int(center_y + line_length * math.sin(math.radians(y_axis_angle)))
-        cv2.line(frame, (center_x, center_y), (end_x, end_y), (0, 255, 255), 2)
+                return (b, g, r)
+            except:
+                # Return white if there's any error in calculation
+                return (255, 255, 255)
+
+        # Draw vertical lines with color based on Z alignment
+        for x1, y1, x2, y2, angle, _ in vertical_lines:
+            color = get_color(angle)
+            cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+
+        # Draw floor lines with color based on X and Y alignment
+        for x1, y1, x2, y2, angle, _ in floor_lines:
+            color = get_color(angle)
+            cv2.line(frame, (x1, y1), (x2, y2), color, 2)
 
         # Display roll angle and axes angles
         cv2.putText(frame, f"Roll: {roll_angle:.2f} deg", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"X-axis: {x_axis_angle:.2f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-        cv2.putText(frame, f"Y-axis: {y_axis_angle:.2f} deg", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"X-axis: {x_axis_angle:.2f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(frame, f"Y-axis: {y_axis_angle:.2f} deg", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
         # Draw padding boundary (optional, for visualization)
         cv2.rectangle(frame, (pad_x, pad_y), (width - pad_x, height - pad_y), (255, 255, 0), 2)
