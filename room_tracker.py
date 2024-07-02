@@ -145,10 +145,3 @@ def detect_lines_and_axes(video_path, output_dir):
     cv2.destroyAllWindows()
 
     print(f"Processed video saved to: {os.path.join(output_dir, 'output_video.mp4')}")
-
-
-# Usage
-video_path = '/home/john/Downloads/larissa-kadu-counter-demo/01-Demo-Ali.mp4'  # Replace with your actual video path
-output_dir = '/home/john/Desktop/out'  # Replace with your desired output directory
-
-detect_lines_and_axes(video_path, output_dir)
