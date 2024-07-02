@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
-from collections import deque
+import random
+import os
+from scipy.cluster.vq import kmeans, vq
 
 
 def preprocess_frame(frame):
@@ -10,17 +12,47 @@ def preprocess_frame(frame):
     return edges
 
 
-def detect_lines(edges):
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=50)
-    return lines
-
-
-def find_longest_lines(lines, num_lines=4):
-    if lines is None:
+def cluster_lines(lines, n_clusters=4):
+    if lines is None or len(lines) < n_clusters:
         return []
-    sorted_lines = sorted(lines, key=lambda x: np.sqrt((x[0][2] - x[0][0]) ** 2 + (x[0][3] - x[0][1]) ** 2),
-                          reverse=True)
-    return sorted_lines[:num_lines]
+
+    points = np.array([(line[0][0], line[0][1], line[0][2], line[0][3]) for line in lines], dtype=np.float64)
+
+    if len(points) < n_clusters:
+        return [lines]  # Return all lines as a single cluster if there are fewer lines than clusters
+
+    centroids, _ = kmeans(points, n_clusters)
+    labels, _ = vq(points, centroids)
+
+    clustered_lines = [[] for _ in range(n_clusters)]
+    for i, label in enumerate(labels):
+        clustered_lines[label].append(lines[i])
+
+    return [cluster for cluster in clustered_lines if cluster]  # Remove empty clusters
+
+
+def detect_lines(edges, frame_height):
+    # Separate detection for lower and upper half of the frame
+    lower_half = edges[frame_height // 2:, :]
+    upper_half = edges[:frame_height // 2, :]
+
+    # Detect lines in lower half (emphasize horizontal and diagonal)
+    lower_lines = cv2.HoughLinesP(lower_half, 1, np.pi / 180, threshold=50,
+                                  minLineLength=50, maxLineGap=20)
+
+    # Detect lines in upper half (emphasize vertical)
+    upper_lines = cv2.HoughLinesP(upper_half, 1, np.pi / 180, threshold=50,
+                                  minLineLength=30, maxLineGap=10)
+
+    # Adjust y-coordinates for upper lines
+    if upper_lines is not None:
+        upper_lines[:, :, 1] += frame_height // 2
+        upper_lines[:, :, 3] += frame_height // 2
+
+    # Combine lower and upper lines
+    all_lines = np.vstack((lower_lines, upper_lines)) if upper_lines is not None else lower_lines
+
+    return all_lines
 
 
 def classify_lines(lines, frame_height):
@@ -28,44 +60,81 @@ def classify_lines(lines, frame_height):
     wall_lines = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
+        dx = x2 - x1
+        dy = y2 - y1
+        angle = np.abs(np.arctan2(dy, dx) * 180 / np.pi)
+
+        # Classify based on angle and position
         if y1 > frame_height / 2 and y2 > frame_height / 2:
-            floor_lines.append(line)
+            if angle < 45 or angle > 135:  # More horizontal
+                floor_lines.append(line)
+            elif 45 <= angle <= 135:  # Diagonal
+                floor_lines.append(line)
         else:
-            wall_lines.append(line)
+            if 75 < angle < 105:  # More vertical
+                wall_lines.append(line)
+            else:
+                floor_lines.append(line)
+
     return floor_lines, wall_lines
 
 
-def find_vanishing_points(lines):
-    if len(lines) < 2:
-        return None
+def find_longest_lines(lines, n_longest=10):
+    if lines is None or len(lines) == 0:
+        return []
 
-    points = []
-    for i in range(len(lines)):
-        for j in range(i + 1, len(lines)):
-            x1, y1, x2, y2 = lines[i][0]
-            x3, y3, x4, y4 = lines[j][0]
+    # Sort lines by length
+    sorted_lines = sorted(lines, key=lambda x: np.sqrt((x[0][2] - x[0][0]) ** 2 + (x[0][3] - x[0][1]) ** 2),
+                          reverse=True)
 
-            A = np.array([
-                [y2 - y1, x1 - x2],
-                [y4 - y3, x3 - x4]
-            ])
-            b = np.array([x1 * y2 - x2 * y1, x3 * y4 - x4 * y3])
+    # Return the n longest lines
+    return sorted_lines[:n_longest]
 
-            try:
-                point = np.linalg.solve(A, b)
-                points.append(point)
-            except np.linalg.LinAlgError:
-                continue
 
-    if not points:
-        return None
+def ransac_vanishing_point(lines, num_iterations=100, threshold=10):
+    best_vp = None
+    max_inliers = 0
 
-    return np.mean(points, axis=0)
+    for _ in range(num_iterations):
+        if len(lines) < 2:
+            continue
+
+        # Randomly select two lines
+        line1, line2 = random.sample(lines, 2)
+
+        x1, y1, x2, y2 = line1[0]
+        x3, y3, x4, y4 = line2[0]
+
+        A = np.array([
+            [y2 - y1, x1 - x2],
+            [y4 - y3, x3 - x4]
+        ])
+        b = np.array([x1 * y2 - x2 * y1, x3 * y4 - x4 * y3])
+
+        try:
+            vp = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Count inliers
+        inliers = 0
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            d = abs((y2 - y1) * vp[0] - (x2 - x1) * vp[1] + x2 * y1 - y2 * x1) / np.sqrt(
+                (y2 - y1) ** 2 + (x2 - x1) ** 2)
+            if d < threshold:
+                inliers += 1
+
+        if inliers > max_inliers:
+            max_inliers = inliers
+            best_vp = vp
+
+    return best_vp
 
 
 def estimate_floor_plane(floor_lines, wall_lines, frame_shape):
-    floor_vp = find_vanishing_points(floor_lines)
-    wall_vp = find_vanishing_points(wall_lines)
+    floor_vp = ransac_vanishing_point(floor_lines)
+    wall_vp = ransac_vanishing_point(wall_lines)
 
     if floor_vp is None or wall_vp is None:
         return None
@@ -82,18 +151,37 @@ def estimate_floor_plane(floor_lines, wall_lines, frame_shape):
     return np.array(corners, dtype=np.float32)
 
 
-def estimate_camera_pose(floor_plane, focal_length):
-    # Simplified camera pose estimation
-    center = np.mean(floor_plane, axis=0)
-    width = np.linalg.norm(floor_plane[1] - floor_plane[0])
-    height = np.linalg.norm(floor_plane[3] - floor_plane[0])
+def pnp_camera_pose(floor_plane, camera_matrix):
+    # Assume world coordinates of floor plane
+    world_points = np.array([
+        [0, 0, 0],
+        [1, 0, 0],
+        [1, 1, 0],
+        [0, 1, 0]
+    ], dtype=np.float32)
 
-    pan = np.arctan2(center[0] - focal_length, focal_length)
-    tilt = np.arctan2(center[1] - focal_length, focal_length)
-    roll = np.arctan2(height, width) - np.pi / 2
-    zoom = focal_length / (width * height) ** 0.25
+    success, rotation_vec, translation_vec = cv2.solvePnP(world_points, floor_plane, camera_matrix, None)
 
-    return np.array([pan, tilt, roll, zoom])
+    if not success:
+        return None
+
+    rotation_mat, _ = cv2.Rodrigues(rotation_vec)
+
+    # Extract pan, tilt, roll from rotation matrix
+    pan = np.arctan2(rotation_mat[0, 2], rotation_mat[2, 2])
+    tilt = np.arcsin(-rotation_mat[1, 2])
+    roll = np.arctan2(rotation_mat[1, 0], rotation_mat[1, 1])
+
+    # Calculate zoom based on translation
+    zoom = 1 / max(translation_vec[2], 1e-6)  # Avoid division by zero
+
+    # Ensure all values are scalar
+    pan = float(pan)
+    tilt = float(tilt)
+    roll = float(roll)
+    zoom = float(zoom)
+
+    return np.array([pan, tilt, roll, zoom], dtype=np.float64)
 
 
 def smooth_poses(poses, window_size=5):
@@ -105,13 +193,57 @@ def smooth_poses(poses, window_size=5):
     return np.array(smoothed)
 
 
-def process_video(video_path):
+def is_keyframe(current_pose, previous_pose, threshold=0.1):
+    if previous_pose is None:
+        return True
+    return np.any(np.abs(current_pose - previous_pose) > threshold)
+
+
+def visualize_frame(frame, floor_plane, camera_pose):
+    # Draw floor plane
+    if floor_plane is not None:
+        cv2.polylines(frame, [floor_plane.astype(int)], True, (0, 255, 0), 2)
+
+    # Display camera pose information
+    if camera_pose is not None:
+        pan, tilt, roll, zoom = camera_pose
+        cv2.putText(frame, f"Pan: {pan:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"Tilt: {tilt:.2f}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"Roll: {roll:.2f}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"Zoom: {zoom:.2f}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    return frame
+
+
+def draw_hough_lines(frame, lines):
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+    return frame
+
+
+def process_video(video_path, output_dir):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
     cap = cv2.VideoCapture(video_path)
+
+    # Estimate camera matrix
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    focal_length = frame_width
+    camera_matrix = np.array([
+        [focal_length, 0, frame_width / 2],
+        [0, focal_length, frame_height / 2],
+        [0, 0, 1]
+    ], dtype=np.float32)
 
     floor_planes = []
     camera_poses = []
 
-    focal_length = 1000  # Assume a focal length (adjust as needed)
+    previous_pose = None
+    frame_count = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -119,17 +251,33 @@ def process_video(video_path):
             break
 
         edges = preprocess_frame(frame)
-        lines = detect_lines(edges)
-        longest_lines = find_longest_lines(lines)
+        lines = detect_lines(edges, frame.shape[0])
+
+        # Find longest lines
+        longest_lines = find_longest_lines(lines, n_longest=20)
+
+        # Draw Hough Lines
+        frame_with_lines = draw_hough_lines(frame.copy(), longest_lines)
+
+        # Save frame with Hough Lines
+        cv2.imwrite(os.path.join(output_dir, f"frame_{frame_count:04d}_hough_lines.jpg"), frame_with_lines)
 
         floor_lines, wall_lines = classify_lines(longest_lines, frame.shape[0])
 
         floor_plane = estimate_floor_plane(floor_lines, wall_lines, frame.shape)
         if floor_plane is not None:
-            floor_planes.append(floor_plane)
+            camera_pose = pnp_camera_pose(floor_plane, camera_matrix)
 
-            camera_pose = estimate_camera_pose(floor_plane, focal_length)
-            camera_poses.append(camera_pose)
+            if camera_pose is not None and is_keyframe(camera_pose, previous_pose):
+                floor_planes.append(floor_plane)
+                camera_poses.append(camera_pose)
+                previous_pose = camera_pose
+
+                # Visualize the frame
+                visualized_frame = visualize_frame(frame.copy(), floor_plane, camera_pose)
+                cv2.imwrite(os.path.join(output_dir, f"frame_{frame_count:04d}_visualized.jpg"), visualized_frame)
+
+        frame_count += 1
 
     cap.release()
 
@@ -147,7 +295,8 @@ def process_video(video_path):
 
 # Usage
 video_path = "/home/john/Downloads/carlos-aline-spin-cam2.mp4"
-floor_plane, camera_poses = process_video(video_path)
+output_dir = "/home/john/Desktop/out"
+floor_plane, camera_poses = process_video(video_path, output_dir)
 
 print("Universal Floor Plane:")
 print(floor_plane)
