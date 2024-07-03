@@ -4,8 +4,8 @@ from ultralytics import YOLO
 from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
-from sklearn.cluster import DBSCAN
 from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
 from filterpy.kalman import KalmanFilter
 
 
@@ -25,6 +25,8 @@ class PersonSegmentation:
         self.person_reid = {}
         self.person_reid_file = os.path.join(output_dir, 'person_reid.json')
         self.kalman_filters = {}
+        self.person_trackers = {}
+        self.max_person_id = 0
 
     @staticmethod
     def initialize_sam():
@@ -128,7 +130,89 @@ class PersonSegmentation:
         # Apply mask to original frame
         bg_only = cv2.bitwise_and(frame, frame, mask=bg_mask)
 
+        # Perform ReID immediately after detection
+        self.perform_reid_for_frame(frame_num)
+
         return bg_only, composite_mask
+
+    def perform_reid_for_frame(self, frame_num):
+        if frame_num == 0:
+            # For the first frame, assign new IDs to all detections
+            for i in range(len(self.pose_mask_associations[0]['detections'])):
+                self.create_new_person(0, i)
+        else:
+            # For subsequent frames, use Kalman filter to predict and match
+            self.predict_and_match(frame_num)
+
+    def create_new_person(self, frame_num, detection_index):
+        self.max_person_id += 1
+        person_id = f"person_{self.max_person_id}"
+        detection = self.pose_mask_associations[frame_num]['detections'][detection_index]
+
+        kf = KalmanFilter(dim_x=4, dim_z=2)
+        kf.F = np.array([[1, 0, 1, 0],
+                         [0, 1, 0, 1],
+                         [0, 0, 1, 0],
+                         [0, 0, 0, 1]])
+        kf.H = np.array([[1, 0, 0, 0],
+                         [0, 1, 0, 0]])
+        kf.R *= 10
+        kf.Q *= 0.1
+
+        center_x = (detection[0] + detection[2]) / 2
+        center_y = (detection[1] + detection[3]) / 2
+        kf.x = np.array([center_x, center_y, 0, 0])
+
+        self.person_trackers[person_id] = {
+            'kf': kf,
+            'last_seen': frame_num,
+            'color_history': [self.pose_mask_associations[frame_num]['colors'][detection_index]]
+        }
+
+        if person_id not in self.person_reid:
+            self.person_reid[person_id] = {}
+        self.person_reid[person_id][frame_num] = [detection_index]
+
+    def predict_and_match(self, frame_num):
+        current_detections = self.pose_mask_associations[frame_num]['detections']
+        detection_centers = np.array([(d[0] + d[2]) / 2 for d in current_detections])
+        detection_centers = np.column_stack((detection_centers, [(d[1] + d[3]) / 2 for d in current_detections]))
+
+        predictions = {}
+        for person_id, tracker in self.person_trackers.items():
+            tracker['kf'].predict()
+            predictions[person_id] = tracker['kf'].x[:2]
+
+        cost_matrix = cdist(np.array(list(predictions.values())), detection_centers)
+
+        matched_indices = linear_sum_assignment(cost_matrix)[1]
+
+        for i, detection_idx in enumerate(matched_indices):
+            person_id = list(predictions.keys())[i]
+            if cost_matrix[i, detection_idx] < 100:  # Threshold for matching
+                self.update_person(person_id, frame_num, detection_idx)
+            else:
+                self.create_new_person(frame_num, detection_idx)
+
+        # Handle unmatched detections
+        unmatched_detections = set(range(len(current_detections))) - set(matched_indices)
+        for detection_idx in unmatched_detections:
+            self.create_new_person(frame_num, detection_idx)
+
+    def update_person(self, person_id, frame_num, detection_idx):
+        detection = self.pose_mask_associations[frame_num]['detections'][detection_idx]
+        center_x = (detection[0] + detection[2]) / 2
+        center_y = (detection[1] + detection[3]) / 2
+
+        self.person_trackers[person_id]['kf'].update(np.array([center_x, center_y]))
+        self.person_trackers[person_id]['last_seen'] = frame_num
+        self.person_trackers[person_id]['color_history'].append(
+            self.pose_mask_associations[frame_num]['colors'][detection_idx]
+        )
+
+        if person_id not in self.person_reid:
+            self.person_reid[person_id] = {}
+        self.person_reid[person_id][frame_num] = [detection_idx]
 
     def estimate_body_part_colors(self, mask, keypoints):
         # This is a simplified estimation. You may need to adjust this based on your specific needs.
@@ -191,17 +275,14 @@ class PersonSegmentation:
             if frame_num % 100 == 0:
                 print(f"Processed {frame_num} frames")
 
-            if frame_num > 4:
+            if frame_num > 2:
                 break
 
         cap.release()
         out_bg.release()
 
-        print("Performing ReID...")
-        self.perform_reid()
-
-        print("Generating ReID video...")
-        self.generate_reid_video(input_path)
+        print("Performing final ReID validation...")
+        self.validate_reid()
 
         print("Saving data...")
         self.save_data()
@@ -236,53 +317,42 @@ class PersonSegmentation:
         cap.release()
         out.release()
 
-    def perform_reid(self):
-        all_features = []
-        frame_indices = []
-        detection_indices = []
+    def validate_reid(self):
+        color_features = {}
+        for person_id, tracker in self.person_trackers.items():
+            color_history = tracker['color_history']
+            avg_color = {
+                'chest_back': np.mean([c['chest_back'] for c in color_history], axis=0),
+                'legs': np.mean([c['legs'] for c in color_history], axis=0),
+                'arms': np.mean([c['arms'] for c in color_history], axis=0)
+            }
+            color_features[person_id] = np.concatenate([
+                avg_color['chest_back'],
+                avg_color['legs'],
+                avg_color['arms']
+            ])
 
-        for frame_num, frame_data in self.pose_mask_associations.items():
-            for i, (detection, colors) in enumerate(zip(frame_data['detections'], frame_data['colors'])):
-                feature = np.concatenate([
-                    colors['chest_back'],
-                    colors['legs'],
-                    colors['arms'],
-                    [(detection[0] + detection[2]) / 2, (detection[1] + detection[3]) / 2],
-                    [(detection[2] - detection[0]) * (detection[3] - detection[1])]
-                ])
-                all_features.append(feature)
-                frame_indices.append(frame_num)
-                detection_indices.append(i)
+        feature_matrix = np.array(list(color_features.values()))
+        distance_matrix = cdist(feature_matrix, feature_matrix)
 
-        if not all_features:
-            print("No valid detections found for ReID.")
-            return
+        merged_ids = set()
+        for i in range(len(feature_matrix)):
+            if i in merged_ids:
+                continue
+            similar_ids = np.where(distance_matrix[i] < 0.1)[0]  # Adjust threshold as needed
+            for j in similar_ids:
+                if i != j and j not in merged_ids:
+                    self.merge_person_ids(list(color_features.keys())[i], list(color_features.keys())[j])
+                    merged_ids.add(j)
 
-        all_features = np.array(all_features)
-
-        # Normalize features
-        all_features = (all_features - np.mean(all_features, axis=0)) / np.std(all_features, axis=0)
-
-        # Perform clustering
-        clustering = DBSCAN(eps=0.5, min_samples=2).fit(all_features)
-
-        labels = clustering.labels_
-
-        # Initialize person_reid with cluster labels
-        self.person_reid = {}
-        for label, frame_num, detection_index in zip(labels, frame_indices, detection_indices):
-            person_id = f"person_{label}" if label != -1 else None
-            if person_id not in self.person_reid:
-                self.person_reid[person_id] = {}
-            if frame_num not in self.person_reid[person_id]:
-                self.person_reid[person_id][frame_num] = []
-            self.person_reid[person_id][frame_num].append(detection_index)
-
-        # Assign IDs to unclustered detections and ensure all detections have an ID
-        self.assign_remaining_ids()
-
-        # Apply Kalman filter and ensure unique identifications per frame
-        self.apply_kalman_filter()
+    def merge_person_ids(self, keep_id, merge_id):
+        for frame, detections in self.person_reid[merge_id].items():
+            if frame not in self.person_reid[keep_id]:
+                self.person_reid[keep_id][frame] = detections
+            else:
+                self.person_reid[keep_id][frame].extend(detections)
+        del self.person_reid[merge_id]
+        del self.person_trackers[merge_id]
 
     def assign_remaining_ids(self):
         max_id = max([int(pid.split('_')[1]) for pid in self.person_reid.keys() if pid is not None], default=-1)
