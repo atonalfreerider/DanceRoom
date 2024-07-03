@@ -41,16 +41,23 @@ class PersonSegmentation:
         if os.path.exists(self.detection_file):
             with open(self.detection_file, 'r') as f:
                 self.detections = json.load(f)
+            print(f"Loaded {len(self.detections)} cached detections.")
+        else:
+            print("No cached detections found.")
+
         if os.path.exists(self.pose_mask_file):
             with open(self.pose_mask_file, 'r') as f:
                 self.pose_mask_associations = json.load(f)
+            print(f"Loaded pose-mask associations for {len(self.pose_mask_associations)} frames.")
+        else:
+            print("No cached pose-mask associations found.")
 
-    def load_existing_data(self):
-        if os.path.exists(self.detection_file):
-            with open(self.detection_file, 'r') as f:
-                self.detections = json.load(f)
-            return True
-        return False
+        if os.path.exists(self.person_reid_file):
+            with open(self.person_reid_file, 'r') as f:
+                self.person_reid = json.load(f)
+            print(f"Loaded person ReID data for {len(self.person_reid)} persons.")
+        else:
+            print("No cached person ReID data found.")
 
     #endregion
 
@@ -60,17 +67,43 @@ class PersonSegmentation:
         if not force_reprocess and self.detections and self.pose_mask_associations:
             print("Using cached detections and pose-mask associations.")
         else:
-            # Process video frames (existing code)
-            pass
+            self.detections = []
+            self.pose_mask_associations = {}
 
-        print("Performing ReID...")
-        self.perform_reid()
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                print(f"Error: Unable to open the input video at {input_path}")
+                return False
+
+            frame_num = 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                bg_only, mask = self.process_frame(frame, frame_num)
+
+                # Store detections
+                self.detections.append(self.pose_mask_associations[frame_num]['detections'])
+
+                frame_num += 1
+                if frame_num % 100 == 0:
+                    print(f"Processed {frame_num} frames")
+
+            cap.release()
+
+            # Save detections and pose-mask associations
+            self.save_data()
+
+        if not self.person_reid or force_reprocess:
+            print("Performing ReID...")
+            self.perform_reid()
+            self.save_data()  # Save updated ReID data
+        else:
+            print("Using cached person ReID data.")
 
         print("Generating ReID video...")
         self.generate_reid_video(input_path)
-
-        print("Saving data...")
-        self.save_data()
 
         print(f"Processing complete.")
         print(f"Background video saved to: {self.bg_video_path}")
@@ -266,6 +299,10 @@ class PersonSegmentation:
 
         self.person_reid = new_person_reid
 
+    #endregion
+
+    #region RENDER
+
     def generate_reid_video(self, input_path):
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -279,7 +316,8 @@ class PersonSegmentation:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(self.reid_video_path, fourcc, fps, (width, height))
 
-        for frame_num in range(len(self.detections)):
+        frame_num = 0
+        while True:
             ret, frame = cap.read()
             if not ret:
                 break
@@ -287,55 +325,23 @@ class PersonSegmentation:
             reid_frame = self.render_reid_frame(frame, frame_num)
             out.write(reid_frame)
 
+            frame_num += 1
+            if frame_num % 100 == 0:
+                print(f"Rendered {frame_num} frames")
+
         cap.release()
         out.release()
-
-    def validate_reid(self):
-        color_features = {}
-        for person_id, tracker in self.person_trackers.items():
-            color_history = tracker['color_history']
-            avg_color = {
-                'chest_back': np.mean([c['chest_back'] for c in color_history], axis=0),
-                'legs': np.mean([c['legs'] for c in color_history], axis=0),
-                'arms': np.mean([c['arms'] for c in color_history], axis=0)
-            }
-            color_features[person_id] = np.concatenate([
-                avg_color['chest_back'],
-                avg_color['legs'],
-                avg_color['arms']
-            ])
-
-        feature_matrix = np.array(list(color_features.values()))
-        distance_matrix = cdist(feature_matrix, feature_matrix)
-
-        merged_ids = set()
-        for i in range(len(feature_matrix)):
-            if i in merged_ids:
-                continue
-            similar_ids = np.where(distance_matrix[i] < 0.1)[0]  # Adjust threshold as needed
-            for j in similar_ids:
-                if i != j and j not in merged_ids:
-                    self.merge_person_ids(list(color_features.keys())[i], list(color_features.keys())[j])
-                    merged_ids.add(j)
-
-    def merge_person_ids(self, keep_id, merge_id):
-        for frame, detections in self.person_reid[merge_id].items():
-            if frame not in self.person_reid[keep_id]:
-                self.person_reid[keep_id][frame] = detections
-            else:
-                self.person_reid[keep_id][frame].extend(detections)
-        del self.person_reid[merge_id]
-        del self.person_trackers[merge_id]
+        print(f"ReID video generated with {frame_num} frames.")
 
     def render_reid_frame(self, frame, frame_num):
-        if frame_num not in self.pose_mask_associations:
+        if str(frame_num) not in self.pose_mask_associations:
             return frame
 
-        frame_data = self.pose_mask_associations[frame_num]
+        frame_data = self.pose_mask_associations[str(frame_num)]
 
         for person_id, person_data in self.person_reid.items():
-            if frame_num in person_data:
-                for detection_index in person_data[frame_num]:
+            if str(frame_num) in person_data:
+                for detection_index in person_data[str(frame_num)]:
                     detection = frame_data['detections'][detection_index]
                     keypoints = frame_data['keypoints'][detection_index]
                     colors = frame_data['colors'][detection_index]
@@ -434,17 +440,17 @@ class PersonSegmentation:
     def save_data(self):
         with open(self.detection_file, 'w') as f:
             json.dump(self.numpy_to_list(self.detections), f, indent=2)
+        print(f"Saved {len(self.detections)} detections to {self.detection_file}")
 
         with open(self.pose_mask_file, 'w') as f:
             json.dump(self.numpy_to_list(self.pose_mask_associations), f, indent=2)
+        print(f"Saved pose-mask associations for {len(self.pose_mask_associations)} frames to {self.pose_mask_file}")
 
         with open(self.person_reid_file, 'w') as f:
             json.dump(self.numpy_to_list(self.person_reid), f, indent=2)
+        print(f"Saved person ReID data to {self.person_reid_file}")
 
     def get_bg_video_path(self):
         return self.bg_video_path
-
-    def get_reid_video_path(self):
-        return self.reid_video_path
 
     #endregion
