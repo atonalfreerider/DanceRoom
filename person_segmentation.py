@@ -51,8 +51,10 @@ class PersonSegmentation:
                 if conf > 0.5:  # Only consider high confidence keypoints
                     x, y = int(x), int(y)
                     if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                        roi = frame[max(0, y - 10):min(frame.shape[0], y + 10), max(0, x - 10):min(frame.shape[1], x + 10)]
-                        roi_mask = mask[max(0, y - 10):min(frame.shape[0], y + 10), max(0, x - 10):min(frame.shape[1], x + 10)]
+                        roi = frame[max(0, y - 10):min(frame.shape[0], y + 10),
+                              max(0, x - 10):min(frame.shape[1], x + 10)]
+                        roi_mask = mask[max(0, y - 10):min(frame.shape[0], y + 10),
+                                   max(0, x - 10):min(frame.shape[1], x + 10)]
                         if roi.size > 0 and roi_mask.any():
                             avg_color = np.mean(roi[roi_mask > 0], axis=0).tolist()
                             colors.append(avg_color)
@@ -75,19 +77,14 @@ class PersonSegmentation:
         frame_colors = []
         frame_keypoints = []
 
-        if frame_num < len(self.detections):
-            frame_detections = self.detections[frame_num]['detections']
-            frame_keypoints = self.detections[frame_num]['keypoints']
-        else:
-            # YOLO detection and pose estimation
-            results = self.yolo_model(frame)
-            for r in results:
-                for box, kps in zip(r.boxes.data, r.keypoints.data):
-                    x1, y1, x2, y2, score, class_id = box.tolist()
-                    if class_id == 0:  # Ensure it's a person
-                        frame_detections.append([x1, y1, x2, y2])
-                        frame_keypoints.append(kps.tolist())
-            self.detections.append({'detections': frame_detections, 'keypoints': frame_keypoints})
+        # YOLO detection and pose estimation
+        results = self.yolo_model(frame)
+        for r in results:
+            for box, kps in zip(r.boxes.data, r.keypoints.data):
+                x1, y1, x2, y2, score, class_id = box.tolist()
+                if class_id == 0:  # Ensure it's a person
+                    frame_detections.append([x1, y1, x2, y2])
+                    frame_keypoints.append(kps.tolist())
 
         # SAM segmentation
         self.sam_predictor.set_image(frame)
@@ -166,26 +163,6 @@ class PersonSegmentation:
             else:
                 print("Existing detection data found, but videos are missing. Reprocessing video...")
 
-        if not os.path.exists(self.bg_video_path):
-            print("Generating background video...")
-            self.generate_background_video(input_path)
-
-        # Perform ReID
-        self.perform_reid()
-
-        # Render ReID video
-        print("Generating ReID video...")
-        self.generate_reid_video(input_path)
-
-        # Save all data
-        self.save_data()
-
-        print(f"Processing complete.")
-        print(f"Background video saved to: {self.bg_video_path}")
-        print(f"ReID video saved to: {self.reid_video_path}")
-        return True
-
-    def generate_background_video(self, input_path):
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             print(f"Error: Unable to open the input video at {input_path}")
@@ -197,9 +174,11 @@ class PersonSegmentation:
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out_bg = cv2.VideoWriter(self.bg_video_path, fourcc, fps, (width, height))
-        out_reid = cv2.VideoWriter(self.reid_video_path, fourcc, fps, (width, height))
 
         frame_num = 0
+        self.detections = []
+        self.pose_mask_associations = {}
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -209,6 +188,8 @@ class PersonSegmentation:
             out_bg.write(bg_only)
 
             frame_num += 1
+            if frame_num % 100 == 0:
+                print(f"Processed {frame_num} frames")
 
             if frame_num > 4:
                 break
@@ -216,34 +197,17 @@ class PersonSegmentation:
         cap.release()
         out_bg.release()
 
-        # Perform ReID
+        print("Performing ReID...")
         self.perform_reid()
 
-        # Render ReID video
-        cap = cv2.VideoCapture(input_path)
-        frame_num = 0
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        print("Generating ReID video...")
+        self.generate_reid_video(input_path)
 
-            reid_frame = self.render_reid_frame(frame, frame_num)
-            out_reid.write(reid_frame)
-
-            frame_num += 1
-
-        cap.release()
-        out_reid.release()
-        cv2.destroyAllWindows()
-
-        # Save all data
+        print("Saving data...")
         self.save_data()
 
+        print(f"Processing complete.")
         print(f"Processed {frame_num} frames")
-        print(f"Masks saved in: {self.mask_dir}")
-        print(f"Detections saved in: {self.detection_file}")
-        print(f"Pose-mask associations saved in: {self.pose_mask_file}")
-        print(f"Person ReID data saved in: {self.person_reid_file}")
         print(f"Background video saved to: {self.bg_video_path}")
         print(f"ReID video saved to: {self.reid_video_path}")
         return True
@@ -457,10 +421,17 @@ class PersonSegmentation:
     def numpy_to_list(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64,
+                              np.uint8, np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+            return float(obj)
         elif isinstance(obj, dict):
-            return {key: self.numpy_to_list(value) for key, value in obj.items()}
+            return {self.numpy_to_list(key): self.numpy_to_list(value) for key, value in obj.items()}
         elif isinstance(obj, list):
             return [self.numpy_to_list(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self.numpy_to_list(item) for item in obj)
         else:
             return obj
 
