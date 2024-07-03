@@ -5,6 +5,7 @@ from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
 from sklearn.cluster import DBSCAN
+from filterpy.kalman import KalmanFilter
 
 
 class PersonSegmentation:
@@ -22,6 +23,7 @@ class PersonSegmentation:
         self.pose_mask_file = os.path.join(output_dir, 'pose_mask_associations.json')
         self.person_reid = {}
         self.person_reid_file = os.path.join(output_dir, 'person_reid.json')
+        self.kalman_filters = {}
 
     @staticmethod
     def initialize_sam():
@@ -48,10 +50,8 @@ class PersonSegmentation:
                 if conf > 0.5:  # Only consider high confidence keypoints
                     x, y = int(x), int(y)
                     if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                        roi = frame[max(0, y - 10):min(frame.shape[0], y + 10),
-                              max(0, x - 10):min(frame.shape[1], x + 10)]
-                        roi_mask = mask[max(0, y - 10):min(frame.shape[0], y + 10),
-                                   max(0, x - 10):min(frame.shape[1], x + 10)]
+                        roi = frame[max(0, y - 10):min(frame.shape[0], y + 10), max(0, x - 10):min(frame.shape[1], x + 10)]
+                        roi_mask = mask[max(0, y - 10):min(frame.shape[0], y + 10), max(0, x - 10):min(frame.shape[1], x + 10)]
                         if roi.size > 0 and roi_mask.any():
                             avg_color = np.mean(roi[roi_mask > 0], axis=0).tolist()
                             colors.append(avg_color)
@@ -132,6 +132,30 @@ class PersonSegmentation:
 
         return bg_only, composite_mask
 
+    def estimate_body_part_colors(self, mask, keypoints):
+        # This is a simplified estimation. You may need to adjust this based on your specific needs.
+        height, width = mask.shape
+        chest_back_color = self.get_color_from_keypoints(mask, keypoints, [5, 6, 11, 12], height, width)
+        legs_color = self.get_color_from_keypoints(mask, keypoints, [13, 14, 15, 16], height, width)
+        arms_color = self.get_color_from_keypoints(mask, keypoints, [7, 8, 9, 10], height, width)
+
+        return {
+            'chest_back': chest_back_color,
+            'legs': legs_color,
+            'arms': arms_color
+        }
+
+    @staticmethod
+    def get_color_from_keypoints(mask, keypoints, indices, height, width):
+        colors = []
+        for idx in indices:
+            x, y, conf = keypoints[idx]
+            if conf > 0.5:  # Only consider high confidence keypoints
+                x, y = int(x), int(y)
+                if 0 <= x < width and 0 <= y < height and mask[y, x] > 0:
+                    colors.append([mask[y, x], mask[y, x], mask[y, x]])  # Grayscale to RGB
+        return np.mean(colors, axis=0) if colors else [0, 0, 0]
+
     def process_video(self, input_path, force_reprocess=False):
         if not force_reprocess and self.load_existing_data():
             print("Loaded existing detection data.")
@@ -141,6 +165,26 @@ class PersonSegmentation:
             else:
                 print("Existing detection data found, but videos are missing. Reprocessing video...")
 
+        if not os.path.exists(self.bg_video_path):
+            print("Generating background video...")
+            self.generate_background_video(input_path)
+
+        # Perform ReID
+        self.perform_reid()
+
+        # Render ReID video
+        print("Generating ReID video...")
+        self.generate_reid_video(input_path)
+
+        # Save all data
+        self.save_data()
+
+        print(f"Processing complete.")
+        print(f"Background video saved to: {self.bg_video_path}")
+        print(f"ReID video saved to: {self.reid_video_path}")
+        return True
+
+    def generate_background_video(self, input_path):
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             print(f"Error: Unable to open the input video at {input_path}")
@@ -200,56 +244,64 @@ class PersonSegmentation:
         print(f"ReID video saved to: {self.reid_video_path}")
         return True
 
+    def generate_reid_video(self, input_path):
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            print(f"Error: Unable to open the input video at {input_path}")
+            return False
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(self.reid_video_path, fourcc, fps, (width, height))
+
+        for frame_num in range(len(self.detections)):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            reid_frame = self.render_reid_frame(frame, frame_num)
+            out.write(reid_frame)
+
+        cap.release()
+        out.release()
+
     def perform_reid(self):
-        all_chest_back_colors = []
-        all_legs_colors = []
-        all_arms_colors = []
-        all_positions = []
-        all_sizes = []
+        all_features = []
         frame_indices = []
         detection_indices = []
 
         for frame_num, frame_data in self.pose_mask_associations.items():
             for i, (detection, colors) in enumerate(zip(frame_data['detections'], frame_data['colors'])):
-                all_chest_back_colors.append(colors['chest_back'])
-                all_legs_colors.append(colors['legs'])
-                all_arms_colors.append(colors['arms'])
-                center_x = (detection[0] + detection[2]) / 2
-                center_y = (detection[1] + detection[3]) / 2
-                all_positions.append([center_x, center_y])
-                size = (detection[2] - detection[0]) * (detection[3] - detection[1])
-                all_sizes.append(size)
+                feature = np.concatenate([
+                    colors['chest_back'],
+                    colors['legs'],
+                    colors['arms'],
+                    [(detection[0] + detection[2]) / 2, (detection[1] + detection[3]) / 2],
+                    [(detection[2] - detection[0]) * (detection[3] - detection[1])]
+                ])
+                all_features.append(feature)
                 frame_indices.append(frame_num)
                 detection_indices.append(i)
 
-        all_chest_back_colors = np.array(all_chest_back_colors)
-        all_legs_colors = np.array(all_legs_colors)
-        all_arms_colors = np.array(all_arms_colors)
-        all_positions = np.array(all_positions)
-        all_sizes = np.array(all_sizes)
+        if not all_features:
+            print("No valid detections found for ReID.")
+            return
+
+        all_features = np.array(all_features)
 
         # Normalize features
-        all_chest_back_colors /= 255.0
-        all_legs_colors /= 255.0
-        all_arms_colors /= 255.0
-        all_positions /= np.max(all_positions)
-        all_sizes /= np.max(all_sizes)
-
-        # Combine features with different weights
-        features = np.hstack([
-            all_chest_back_colors * 0.5,
-            all_legs_colors * 0.3,
-            all_arms_colors * 0.2,
-            all_positions * 0.1,
-            all_sizes.reshape(-1, 1) * 0.1
-        ])
+        all_features = (all_features - np.mean(all_features, axis=0)) / np.std(all_features, axis=0)
 
         # Perform clustering
-        clustering = DBSCAN(eps=0.1, min_samples=2).fit(features)
+        clustering = DBSCAN(eps=0.5, min_samples=2).fit(all_features)
 
         labels = clustering.labels_
 
         # Assign person IDs
+        self.person_reid = {}
         for label, frame_num, detection_index in zip(labels, frame_indices, detection_indices):
             if label == -1:
                 continue  # Skip noise points
@@ -259,6 +311,53 @@ class PersonSegmentation:
             if frame_num not in self.person_reid[person_id]:
                 self.person_reid[person_id][frame_num] = []
             self.person_reid[person_id][frame_num].append(detection_index)
+
+        # Apply Kalman filter and ensure unique identifications per frame
+        self.apply_kalman_filter()
+
+    def apply_kalman_filter(self):
+        for person_id in self.person_reid:
+            kf = KalmanFilter(dim_x=4, dim_z=2)  # State: [x, y, dx, dy], Measurement: [x, y]
+            kf.F = np.array([[1, 0, 1, 0],
+                             [0, 1, 0, 1],
+                             [0, 0, 1, 0],
+                             [0, 0, 0, 1]])
+            kf.H = np.array([[1, 0, 0, 0],
+                             [0, 1, 0, 0]])
+            kf.R *= 10
+            kf.Q *= 0.1
+            self.kalman_filters[person_id] = kf
+
+        new_person_reid = {}
+        all_frames = sorted(set(frame for person in self.person_reid.values() for frame in person))
+
+        for current_frame in all_frames:
+            frame_assignments = {}
+            for person_id, frames in self.person_reid.items():
+                if current_frame in frames:
+                    detection_index = frames[current_frame][0]
+                    detection = self.pose_mask_associations[current_frame]['detections'][detection_index]
+                    center_x = (detection[0] + detection[2]) / 2
+                    center_y = (detection[1] + detection[3]) / 2
+
+                    kf = self.kalman_filters[person_id]
+                    if current_frame == min(frames.keys()):
+                        kf.x = np.array([center_x, center_y, 0, 0])
+                    else:
+                        kf.predict()
+                    kf.update(np.array([center_x, center_y]))
+
+                    distance = np.linalg.norm(kf.x[:2] - np.array([center_x, center_y]))
+                    if distance < 50:  # Threshold for acceptable distance
+                        if current_frame not in frame_assignments or distance < frame_assignments[current_frame][1]:
+                            frame_assignments[current_frame] = (person_id, distance)
+
+            for assigned_frame, (person_id, _) in frame_assignments.items():
+                if person_id not in new_person_reid:
+                    new_person_reid[person_id] = {}
+                new_person_reid[person_id][assigned_frame] = self.person_reid[person_id][assigned_frame]
+
+        self.person_reid = new_person_reid
 
     def render_reid_frame(self, frame, frame_num):
         if frame_num not in self.pose_mask_associations:
