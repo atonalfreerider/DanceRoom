@@ -3,6 +3,7 @@ import numpy as np
 import math
 import os
 
+
 def draw_pose(frame, pose):
     for person in pose:
         for x, y, conf in person:
@@ -11,7 +12,8 @@ def draw_pose(frame, pose):
         # You can add lines connecting keypoints here if desired
     return frame
 
-def detect_lines_and_axes(video_path, output_dir, poses):
+
+def detect_lines_and_axes(video_path, output_dir):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -114,10 +116,10 @@ def detect_lines_and_axes(video_path, output_dir, poses):
                 g = int(255 * np.clip(z_align, 0, 1))
                 b = int(255 * np.clip(y_align, 0, 1))
 
-                return (b, g, r)
+                return b, g, r
             except:
                 # Return white if there's any error in calculation
-                return (255, 255, 255)
+                return 255, 255, 255
 
         # Draw vertical lines with color based on Z alignment
         for x1, y1, x2, y2, angle, _ in vertical_lines:
@@ -136,10 +138,6 @@ def detect_lines_and_axes(video_path, output_dir, poses):
 
         # Draw padding boundary (optional, for visualization)
         cv2.rectangle(frame, (pad_x, pad_y), (width - pad_x, height - pad_y), (255, 255, 0), 2)
-
-        # Draw poses
-        if frame_count < len(poses):
-            frame = draw_pose(frame, poses[frame_count]['poses'])
 
         out.write(frame)
 
