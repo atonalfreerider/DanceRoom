@@ -1,70 +1,63 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO, SAM
+from ultralytics import YOLO
+from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
 
 class PersonSegmentation:
     def __init__(self, output_dir):
-        self.seg_model = SAM('sam_b.pt')
-        self.pose_model = YOLO('yolov8x-pose-p6.pt')
+        self.yolo_model = YOLO('yolov8x-pose-p6.pt')
+        self.sam_predictor = self.initialize_sam()
         self.output_dir = output_dir
         self.mask_dir = os.path.join(output_dir, 'masks')
         os.makedirs(self.mask_dir, exist_ok=True)
-        self.poses = []
-        self.pose_file = os.path.join(output_dir, 'poses.json')
+        self.detections = []
+        self.detection_file = os.path.join(output_dir, 'detections.json')
         self.bg_video_path = os.path.join(output_dir, 'background_only.mp4')
 
+    def initialize_sam(self):
+        sam = sam_model_registry["default"](checkpoint="sam_vit_h_4b8939.pth")
+        return SamPredictor(sam)
+
     def load_existing_data(self):
-        if os.path.exists(self.pose_file):
-            with open(self.pose_file, 'r') as f:
-                self.poses = json.load(f)
+        if os.path.exists(self.detection_file):
+            with open(self.detection_file, 'r') as f:
+                self.detections = json.load(f)
             return True
         return False
+
+    import numpy as np
 
     def process_frame(self, frame, frame_num):
         mask_file = os.path.join(self.mask_dir, f'mask_{frame_num:06d}.png')
 
-        # Use cached poses if available, otherwise perform pose detection
-        if frame_num < len(self.poses):
-            frame_poses = self.poses[frame_num]["poses"]
+        if frame_num < len(self.detections):
+            frame_detections = self.detections[frame_num]
         else:
-            # Pose detection
-            pose_results = self.pose_model(frame, classes=[0])
-            frame_poses = []
-            for r in pose_results:
-                if r.keypoints is not None:
-                    for person_keypoints in r.keypoints.data:
-                        keypoints = person_keypoints.cpu().numpy().tolist()
-                        frame_poses.append(keypoints)
-            self.poses.append({"frame": frame_num, "poses": frame_poses})
+            # YOLO detection
+            results = self.yolo_model(frame, classes=[0])  # 0 is the class index for person
+            frame_detections = []
+            for r in results:
+                for box in r.boxes.data:
+                    x1, y1, x2, y2, score, class_id = box.tolist()
+                    if class_id == 0:  # Ensure it's a person
+                        frame_detections.append([x1, y1, x2, y2])
+            self.detections.append(frame_detections)
 
         if os.path.exists(mask_file):
             mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
         else:
-            # Segmentation
-            seg_results = self.seg_model(frame)
+            # SAM segmentation
+            self.sam_predictor.set_image(frame)
             mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-
-            for seg in seg_results:
-                for instance_mask in seg.masks.data:
-                    instance_mask_np = instance_mask.cpu().numpy().astype(np.uint8)
-
-                    # Check if the segment contains any pose keypoints
-                    contains_keypoints = False
-                    for pose in frame_poses:
-                        for kp in pose:
-                            x, y, conf = kp
-                            if conf > 0.01 and 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                                if instance_mask_np[int(y), int(x)] > 0:
-                                    contains_keypoints = True
-                                    break
-                        if contains_keypoints:
-                            break
-
-                    if contains_keypoints:
-                        # If the segment contains keypoints, include the entire segment
-                        mask = np.logical_or(mask, instance_mask_np).astype(np.uint8)
+            for box in frame_detections:
+                box_array = np.array(box)  # Convert list to numpy array
+                masks, _, _ = self.sam_predictor.predict(
+                    box=box_array,
+                    multimask_output=False
+                )
+                mask = np.logical_or(mask, masks[0]).astype(np.uint8)
 
             # Scale the mask to 255
             mask = mask * 255
@@ -85,15 +78,13 @@ class PersonSegmentation:
         return bg_only, mask
 
     def process_video(self, input_path, force_reprocess=False):
-        if force_reprocess:
-            self.poses = []  # Clear existing poses if force_reprocess is True
-        elif self.load_existing_data():
-            print("Loaded existing pose data.")
+        if not force_reprocess and self.load_existing_data():
+            print("Loaded existing detection data.")
             if os.path.exists(self.bg_video_path):
                 print(f"Background video already exists at {self.bg_video_path}")
                 return True
             else:
-                print("Existing pose data found, but background video is missing. Reprocessing video...")
+                print("Existing detection data found, but background video is missing. Reprocessing video...")
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -118,25 +109,22 @@ class PersonSegmentation:
 
             frame_num += 1
 
-            if frame_num > 5:
-                break
-
         cap.release()
         out.release()
         cv2.destroyAllWindows()
 
-        # Save poses to JSON file
-        with open(self.pose_file, 'w') as f:
-            json.dump(self.poses, f, indent=2)
+        # Save detections to JSON file
+        with open(self.detection_file, 'w') as f:
+            json.dump(self.detections, f, indent=2)
 
         print(f"Processed {frame_num} frames")
         print(f"Masks saved in: {self.mask_dir}")
-        print(f"Poses saved in: {self.pose_file}")
+        print(f"Detections saved in: {self.detection_file}")
         print(f"Background video saved to: {self.bg_video_path}")
         return True
 
-    def get_poses(self):
-        return self.poses
+    def get_detections(self):
+        return self.detections
 
     def get_bg_video_path(self):
         return self.bg_video_path
