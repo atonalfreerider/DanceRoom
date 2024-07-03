@@ -214,30 +214,6 @@ class PersonSegmentation:
             self.person_reid[person_id] = {}
         self.person_reid[person_id][frame_num] = [detection_idx]
 
-    def estimate_body_part_colors(self, mask, keypoints):
-        # This is a simplified estimation. You may need to adjust this based on your specific needs.
-        height, width = mask.shape
-        chest_back_color = self.get_color_from_keypoints(mask, keypoints, [5, 6, 11, 12], height, width)
-        legs_color = self.get_color_from_keypoints(mask, keypoints, [13, 14, 15, 16], height, width)
-        arms_color = self.get_color_from_keypoints(mask, keypoints, [7, 8, 9, 10], height, width)
-
-        return {
-            'chest_back': chest_back_color,
-            'legs': legs_color,
-            'arms': arms_color
-        }
-
-    @staticmethod
-    def get_color_from_keypoints(mask, keypoints, indices, height, width):
-        colors = []
-        for idx in indices:
-            x, y, conf = keypoints[idx]
-            if conf > 0.5:  # Only consider high confidence keypoints
-                x, y = int(x), int(y)
-                if 0 <= x < width and 0 <= y < height and mask[y, x] > 0:
-                    colors.append([mask[y, x], mask[y, x], mask[y, x]])  # Grayscale to RGB
-        return np.mean(colors, axis=0) if colors else [0, 0, 0]
-
     def process_video(self, input_path, force_reprocess=False):
         if not force_reprocess and self.load_existing_data():
             print("Loaded existing detection data.")
@@ -275,9 +251,6 @@ class PersonSegmentation:
             if frame_num % 100 == 0:
                 print(f"Processed {frame_num} frames")
 
-            if frame_num > 2:
-                break
-
         cap.release()
         out_bg.release()
 
@@ -286,6 +259,8 @@ class PersonSegmentation:
 
         print("Saving data...")
         self.save_data()
+
+        self.generate_reid_video(input_path)
 
         print(f"Processing complete.")
         print(f"Processed {frame_num} frames")
@@ -353,89 +328,6 @@ class PersonSegmentation:
                 self.person_reid[keep_id][frame].extend(detections)
         del self.person_reid[merge_id]
         del self.person_trackers[merge_id]
-
-    def assign_remaining_ids(self):
-        max_id = max([int(pid.split('_')[1]) for pid in self.person_reid.keys() if pid is not None], default=-1)
-
-        for frame_num, frame_data in self.pose_mask_associations.items():
-            assigned_detections = set()
-            for person_id, person_data in self.person_reid.items():
-                if person_id is not None and frame_num in person_data:
-                    assigned_detections.update(person_data[frame_num])
-
-            unassigned_detections = set(range(len(frame_data['detections']))) - assigned_detections
-
-            for detection_index in unassigned_detections:
-                max_id += 1
-                new_person_id = f"person_{max_id}"
-                if new_person_id not in self.person_reid:
-                    self.person_reid[new_person_id] = {}
-                if frame_num not in self.person_reid[new_person_id]:
-                    self.person_reid[new_person_id][frame_num] = []
-                self.person_reid[new_person_id][frame_num].append(detection_index)
-
-        # Remove the None key if it exists
-        self.person_reid.pop(None, None)
-
-    def apply_kalman_filter(self):
-        for person_id in self.person_reid:
-            kf = KalmanFilter(dim_x=4, dim_z=2)  # State: [x, y, dx, dy], Measurement: [x, y]
-            kf.F = np.array([[1, 0, 1, 0],
-                             [0, 1, 0, 1],
-                             [0, 0, 1, 0],
-                             [0, 0, 0, 1]])
-            kf.H = np.array([[1, 0, 0, 0],
-                             [0, 1, 0, 0]])
-            kf.R *= 10
-            kf.Q *= 0.1
-            self.kalman_filters[person_id] = kf
-
-        all_frames = sorted(set(frame for person in self.person_reid.values() for frame in person))
-
-        for current_frame in all_frames:
-            frame_detections = self.pose_mask_associations[current_frame]['detections']
-            detection_centers = np.array([(d[0] + d[2]) / 2 for d in frame_detections])
-            detection_centers = np.column_stack((detection_centers, [(d[1] + d[3]) / 2 for d in frame_detections]))
-
-            person_predictions = {}
-            for person_id, kf in self.kalman_filters.items():
-                if current_frame in self.person_reid[person_id]:
-                    last_detection = self.person_reid[person_id][current_frame][0]
-                    last_center = detection_centers[last_detection]
-                    if kf.x is None:
-                        kf.x = np.array([last_center[0], last_center[1], 0, 0])
-                    else:
-                        kf.predict()
-                    person_predictions[person_id] = kf.x[:2]
-
-            cost_matrix = np.zeros((len(person_predictions), len(frame_detections)))
-            for i, (person_id, pred) in enumerate(person_predictions.items()):
-                cost_matrix[i] = np.linalg.norm(detection_centers - pred.reshape(1, 2), axis=1)
-
-            if cost_matrix.size > 0:
-                row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-                new_person_reid = {pid: {} for pid in self.person_reid}
-                for person_idx, detection_idx in zip(row_ind, col_ind):
-                    person_id = list(person_predictions.keys())[person_idx]
-                    new_person_reid[person_id][current_frame] = [detection_idx]
-                    self.kalman_filters[person_id].update(detection_centers[detection_idx])
-
-                # Assign remaining detections to new or existing person IDs
-                unassigned_detections = set(range(len(frame_detections))) - set(col_ind)
-                for detection_idx in unassigned_detections:
-                    closest_person = min(self.person_reid.keys(),
-                                         key=lambda pid: np.linalg.norm(
-                                             detection_centers[detection_idx] - self.kalman_filters[pid].x[:2]))
-                    if current_frame not in new_person_reid[closest_person]:
-                        new_person_reid[closest_person][current_frame] = [detection_idx]
-                    else:
-                        new_person_reid[closest_person][current_frame].append(detection_idx)
-
-                self.person_reid = new_person_reid
-            else:
-                # Handle the case where there are no predictions or detections
-                print(f"No predictions or detections for frame {current_frame}")
 
     def render_reid_frame(self, frame, frame_num):
         if frame_num not in self.pose_mask_associations:
