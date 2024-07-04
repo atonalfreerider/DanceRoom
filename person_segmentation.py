@@ -5,9 +5,8 @@ from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import mahalanobis
+from scipy.spatial.distance import cdist
 from filterpy.kalman import KalmanFilter
-from sklearn.cluster import DBSCAN
 
 
 class PersonSegmentation:
@@ -29,7 +28,9 @@ class PersonSegmentation:
         self.person_trackers = {}
         self.max_person_id = 0
         self.load_cached_data()
-        self.max_age = 30  # Maximum number of frames a person can be missing before being removed
+        self.max_age = 60  # Increase max age to allow for longer occlusions
+        self.min_hits = 3  # Minimum number of detections before considering a track valid
+        self.max_persons = 8  # Maximum number of persons to track simultaneously
 
     #region INITIALIZATION
 
@@ -179,32 +180,31 @@ class PersonSegmentation:
     #region ReID
 
     def create_new_person(self, frame_num, detection_index):
+        if len(self.person_trackers) >= self.max_persons:
+            return
+
         self.max_person_id += 1
         person_id = f"person_{self.max_person_id}"
         detection = self.pose_mask_associations[frame_num]['detections'][detection_index]
         color = self.pose_mask_associations[frame_num]['colors'][detection_index]
 
-        kf = KalmanFilter(dim_x=10, dim_z=6)  # State: [x, y, w, h, dx, dy, dw, dh, c, dc]
-        kf.F = np.eye(10)
-        kf.F[:4, 4:8] = np.eye(4)  # velocity components
-        kf.H = np.zeros((6, 10))
-        kf.H[:4, :4] = np.eye(4)
-        kf.H[4, 8] = 1  # color component
-        kf.H[5, 9] = 1  # dummy component
+        kf = KalmanFilter(dim_x=6, dim_z=5)  # State: [x, y, w, h, c, v]
+        kf.F = np.eye(6)
+        kf.F[:5, 5] = 1  # velocity component
+        kf.H = np.eye(5, 6)
         kf.R *= 10
-        kf.Q[4:8, 4:8] *= 0.01  # small changes in velocity
-        kf.Q[8:, 8:] *= 0.01  # small changes in color and dummy
-        kf.P += np.eye(10) * 0.01  # Add small regularization term
+        kf.Q[-1, -1] *= 0.01  # small changes in velocity
 
         x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
         c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
-        kf.x = np.array([x, y, w, h, 0, 0, 0, 0, c, 0])
+        kf.x = np.array([x, y, w, h, c, 0])
 
         self.person_trackers[person_id] = {
             'kf': kf,
             'last_seen': frame_num,
             'color_history': [color],
-            'age': 0
+            'age': 0,
+            'hits': 1
         }
 
         if person_id not in self.person_reid:
@@ -226,35 +226,31 @@ class PersonSegmentation:
         for d, c in zip(current_detections, current_colors):
             x, y, w, h = d[0], d[1], d[2] - d[0], d[3] - d[1]
             color = np.mean([np.mean(c['chest_back']), np.mean(c['legs']), np.mean(c['arms'])])
-            detection_features.append([x, y, w, h, color, 0])  # Add dummy variable
+            detection_features.append([x, y, w, h, color])
         detection_features = np.array(detection_features)
 
         predictions = {}
         for person_id, tracker in self.person_trackers.items():
             tracker['kf'].predict()
-            predictions[person_id] = tracker['kf'].x
+            predictions[person_id] = tracker['kf'].x[:5]  # x, y, w, h, color
 
         if not predictions:
             for detection_idx in range(len(current_detections)):
                 self.create_new_person(frame_num, detection_idx)
             return
 
-        cost_matrix = np.zeros((len(predictions), len(detection_features)))
-        for i, (person_id, pred) in enumerate(predictions.items()):
-            for j, det in enumerate(detection_features):
-                cost_matrix[i, j] = self.calculate_distance(pred, det, self.person_trackers[person_id]['kf'])
+        cost_matrix = cdist(np.array(list(predictions.values())), detection_features)
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         matched_person_ids = set()
         for i, detection_idx in zip(row_ind, col_ind):
             person_id = list(predictions.keys())[i]
-            if cost_matrix[i, detection_idx] < 50:  # Increased threshold
+            if cost_matrix[i, detection_idx] < 100:  # Adjust this threshold as needed
                 self.update_person(person_id, frame_num, detection_idx)
                 matched_person_ids.add(person_id)
             else:
-                # Only create a new person if the detection is far from all existing persons
-                if np.all(cost_matrix[:, detection_idx] > 100):
+                if len(self.person_trackers) < self.max_persons:
                     self.create_new_person(frame_num, detection_idx)
 
         # Update age for all trackers and remove old ones
@@ -265,18 +261,11 @@ class PersonSegmentation:
                     del self.person_trackers[person_id]
             else:
                 self.person_trackers[person_id]['age'] = 0
+                self.person_trackers[person_id]['hits'] += 1
 
-    @staticmethod
-    def calculate_distance(prediction, detection, kf):
-        diff = detection[:5] - prediction[:5]  # Exclude dummy variable
-        try:
-            S = kf.S[:5, :5]  # Covariance of the observation
-            SI = np.linalg.inv(S)
-            distance = mahalanobis(diff, np.zeros_like(diff), SI)
-        except np.linalg.LinAlgError:
-            # Fallback to Euclidean distance if Mahalanobis fails
-            distance = np.linalg.norm(diff)
-        return distance
+        # Remove trackers that haven't been matched enough times
+        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items()
+                                if tracker['hits'] >= self.min_hits}
 
     def update_person(self, person_id, frame_num, detection_idx):
         detection = self.pose_mask_associations[frame_num]['detections'][detection_idx]
@@ -285,16 +274,13 @@ class PersonSegmentation:
         x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
         c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
 
-        # Add a dummy variable to match the Kalman filter's expected 6-dimensional input
-        measurement = np.array([x, y, w, h, c, 0])
+        measurement = np.array([x, y, w, h, c])
         self.person_trackers[person_id]['kf'].update(measurement)
-
-        # Add small regularization term
-        self.person_trackers[person_id]['kf'].P += np.eye(10) * 0.01
 
         self.person_trackers[person_id]['last_seen'] = frame_num
         self.person_trackers[person_id]['color_history'].append(color)
         self.person_trackers[person_id]['age'] = 0
+        self.person_trackers[person_id]['hits'] += 1
 
         if person_id not in self.person_reid:
             self.person_reid[person_id] = {}
@@ -310,54 +296,36 @@ class PersonSegmentation:
             self.perform_reid_for_frame(frame_num)
 
         # Remove short tracks (likely false positives)
-        min_track_length = 5
+        min_track_length = 10
         self.person_reid = {pid: frames for pid, frames in self.person_reid.items() if len(frames) >= min_track_length}
 
-        # Color-based clustering and refinement
-        self.refine_reid_with_color_clustering()
+        # Merge similar tracks
+        self.merge_similar_tracks()
 
-    def refine_reid_with_color_clustering(self):
-        color_features = []
-        person_frames = []
-
+    def merge_similar_tracks(self):
+        track_features = {}
         for person_id, frames in self.person_reid.items():
-            for frame_num, detection_indices in frames.items():
-                for idx in detection_indices:
-                    color = self.pose_mask_associations[frame_num]['colors'][idx]
-                    feature = np.concatenate([color['chest_back'], color['legs'], color['arms']])
-                    color_features.append(feature)
-                    person_frames.append((person_id, frame_num, idx))
+            colors = [self.pose_mask_associations[frame]['colors'][idx[0]] for frame, idx in frames.items()]
+            avg_color = np.mean([np.mean([c['chest_back'], c['legs'], c['arms']], axis=0) for c in colors], axis=0)
+            track_features[person_id] = avg_color
 
-        color_features = np.array(color_features)
+        merged_ids = set()
+        for id1 in track_features:
+            if id1 in merged_ids:
+                continue
+            for id2 in track_features:
+                if id1 != id2 and id2 not in merged_ids:
+                    if np.linalg.norm(track_features[id1] - track_features[id2]) < 30:  # Adjust threshold as needed
+                        self.merge_tracks(id1, id2)
+                        merged_ids.add(id2)
 
-        # Estimate the number of clusters based on the average number of people per frame
-        n_people_per_frame = [len(frame_data['detections']) for frame_data in self.pose_mask_associations.values()]
-        avg_people = max(5, int(np.mean(n_people_per_frame)))  # At least 5 clusters
-
-        # Perform DBSCAN clustering
-        clustering = DBSCAN(eps=0.1, min_samples=3).fit(color_features)
-        labels = clustering.labels_
-
-        # If DBSCAN produces too many clusters, use KMeans
-        if len(set(labels)) - (1 if -1 in labels else 0) > avg_people * 1.5:
-            from sklearn.cluster import KMeans
-            kmeans = KMeans(n_clusters=avg_people).fit(color_features)
-            labels = kmeans.labels_
-
-        new_person_reid = {}
-        for (old_person_id, frame_num, idx), label in zip(person_frames, labels):
-            if label == -1:
-                new_person_id = old_person_id  # Keep original ID for noise points
+    def merge_tracks(self, id1, id2):
+        for frame, detections in self.person_reid[id2].items():
+            if frame in self.person_reid[id1]:
+                self.person_reid[id1][frame].extend(detections)
             else:
-                new_person_id = f"person_{label}"
-
-            if new_person_id not in new_person_reid:
-                new_person_reid[new_person_id] = {}
-            if frame_num not in new_person_reid[new_person_id]:
-                new_person_reid[new_person_id][frame_num] = []
-            new_person_reid[new_person_id][frame_num].append(idx)
-
-        self.person_reid = new_person_reid
+                self.person_reid[id1][frame] = detections
+        del self.person_reid[id2]
 
     #endregion
 
