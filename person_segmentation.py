@@ -181,30 +181,27 @@ class PersonSegmentation:
         self.max_person_id += 1
         person_id = f"person_{self.max_person_id}"
         detection = self.pose_mask_associations[frame_num]['detections'][detection_index]
+        color = self.pose_mask_associations[frame_num]['colors'][detection_index]
 
-        kf = KalmanFilter(dim_x=8, dim_z=4)  # State: [x, y, w, h, dx, dy, dw, dh]
-        kf.F = np.array([[1, 0, 0, 0, 1, 0, 0, 0],
-                         [0, 1, 0, 0, 0, 1, 0, 0],
-                         [0, 0, 1, 0, 0, 0, 1, 0],
-                         [0, 0, 0, 1, 0, 0, 0, 1],
-                         [0, 0, 0, 0, 1, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 1, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 1, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 1]])
-        kf.H = np.array([[1, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 1, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 1, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 1, 0, 0, 0, 0]])
+        kf = KalmanFilter(dim_x=10, dim_z=6)  # State: [x, y, w, h, dx, dy, dw, dh, c, dc]
+        kf.F = np.eye(10)
+        kf.F[:4, 4:8] = np.eye(4)  # velocity components
+        kf.H = np.zeros((6, 10))
+        kf.H[:4, :4] = np.eye(4)
+        kf.H[4, 8] = 1  # color component
+        kf.H[5, 9] = 1  # dummy component
         kf.R *= 10
-        kf.Q[4:, 4:] *= 0.01
+        kf.Q[4:8, 4:8] *= 0.01  # small changes in velocity
+        kf.Q[8:, 8:] *= 0.01  # small changes in color and dummy
 
         x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
-        kf.x = np.array([x, y, w, h, 0, 0, 0, 0])
+        c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
+        kf.x = np.array([x, y, w, h, 0, 0, 0, 0, c, 0])
 
         self.person_trackers[person_id] = {
             'kf': kf,
             'last_seen': frame_num,
-            'color_history': [self.pose_mask_associations[frame_num]['colors'][detection_index]]
+            'color_history': [color]
         }
 
         if person_id not in self.person_reid:
@@ -220,12 +217,19 @@ class PersonSegmentation:
 
     def predict_and_match(self, frame_num):
         current_detections = self.pose_mask_associations[frame_num]['detections']
-        detection_features = np.array([[d[0], d[1], d[2] - d[0], d[3] - d[1]] for d in current_detections])
+        current_colors = self.pose_mask_associations[frame_num]['colors']
+
+        detection_features = []
+        for d, c in zip(current_detections, current_colors):
+            x, y, w, h = d[0], d[1], d[2] - d[0], d[3] - d[1]
+            color = np.mean([np.mean(c['chest_back']), np.mean(c['legs']), np.mean(c['arms'])])
+            detection_features.append([x, y, w, h, color, 0])  # Add dummy variable
+        detection_features = np.array(detection_features)
 
         predictions = {}
         for person_id, tracker in self.person_trackers.items():
             tracker['kf'].predict()
-            predictions[person_id] = tracker['kf'].x[:4]
+            predictions[person_id] = tracker['kf'].x[:4]  # Only position and size for distance calculation
 
         if not predictions:
             for detection_idx in range(len(current_detections)):
@@ -233,14 +237,19 @@ class PersonSegmentation:
             return
 
         prediction_array = np.array(list(predictions.values()))
-        cost_matrix = cdist(prediction_array, detection_features)
+        position_cost = cdist(prediction_array, detection_features[:, :4])
+        color_cost = cdist(np.array([tracker['kf'].x[8] for tracker in self.person_trackers.values()]).reshape(-1, 1),
+                           detection_features[:, 4].reshape(-1, 1))
+
+        # Combine position and color costs
+        cost_matrix = position_cost + 0.5 * color_cost  # Adjust the weight of color cost as needed
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         matched_person_ids = set()
         for i, detection_idx in zip(row_ind, col_ind):
             person_id = list(predictions.keys())[i]
-            if cost_matrix[i, detection_idx] < 100:  # Threshold for matching
+            if cost_matrix[i, detection_idx] < 150:  # Adjust threshold as needed
                 self.update_person(person_id, frame_num, detection_idx)
                 matched_person_ids.add(person_id)
             else:
@@ -250,17 +259,22 @@ class PersonSegmentation:
         for detection_idx in unmatched_detections:
             self.create_new_person(frame_num, detection_idx)
 
-        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items() if pid in matched_person_ids}
+        # Remove trackers for persons not seen in this frame
+        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items() if
+                                pid in matched_person_ids}
 
     def update_person(self, person_id, frame_num, detection_idx):
         detection = self.pose_mask_associations[frame_num]['detections'][detection_idx]
-        x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
+        color = self.pose_mask_associations[frame_num]['colors'][detection_idx]
 
-        self.person_trackers[person_id]['kf'].update(np.array([x, y, w, h]))
+        x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
+        c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
+
+        # Add a dummy variable to match the Kalman filter's expected 6-dimensional input
+        measurement = np.array([x, y, w, h, c, 0])
+        self.person_trackers[person_id]['kf'].update(measurement)
         self.person_trackers[person_id]['last_seen'] = frame_num
-        self.person_trackers[person_id]['color_history'].append(
-            self.pose_mask_associations[frame_num]['colors'][detection_idx]
-        )
+        self.person_trackers[person_id]['color_history'].append(color)
 
         if person_id not in self.person_reid:
             self.person_reid[person_id] = {}
