@@ -5,7 +5,7 @@ from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist
+from scipy.spatial.distance import mahalanobis
 from filterpy.kalman import KalmanFilter
 from sklearn.cluster import DBSCAN
 
@@ -29,6 +29,7 @@ class PersonSegmentation:
         self.person_trackers = {}
         self.max_person_id = 0
         self.load_cached_data()
+        self.max_age = 30  # Maximum number of frames a person can be missing before being removed
 
     #region INITIALIZATION
 
@@ -193,6 +194,7 @@ class PersonSegmentation:
         kf.R *= 10
         kf.Q[4:8, 4:8] *= 0.01  # small changes in velocity
         kf.Q[8:, 8:] *= 0.01  # small changes in color and dummy
+        kf.P += np.eye(10) * 0.01  # Add small regularization term
 
         x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
         c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
@@ -201,7 +203,8 @@ class PersonSegmentation:
         self.person_trackers[person_id] = {
             'kf': kf,
             'last_seen': frame_num,
-            'color_history': [color]
+            'color_history': [color],
+            'age': 0
         }
 
         if person_id not in self.person_reid:
@@ -229,39 +232,51 @@ class PersonSegmentation:
         predictions = {}
         for person_id, tracker in self.person_trackers.items():
             tracker['kf'].predict()
-            predictions[person_id] = tracker['kf'].x[:4]  # Only position and size for distance calculation
+            predictions[person_id] = tracker['kf'].x
 
         if not predictions:
             for detection_idx in range(len(current_detections)):
                 self.create_new_person(frame_num, detection_idx)
             return
 
-        prediction_array = np.array(list(predictions.values()))
-        position_cost = cdist(prediction_array, detection_features[:, :4])
-        color_cost = cdist(np.array([tracker['kf'].x[8] for tracker in self.person_trackers.values()]).reshape(-1, 1),
-                           detection_features[:, 4].reshape(-1, 1))
-
-        # Combine position and color costs
-        cost_matrix = position_cost + 0.5 * color_cost  # Adjust the weight of color cost as needed
+        cost_matrix = np.zeros((len(predictions), len(detection_features)))
+        for i, (person_id, pred) in enumerate(predictions.items()):
+            for j, det in enumerate(detection_features):
+                cost_matrix[i, j] = self.calculate_distance(pred, det, self.person_trackers[person_id]['kf'])
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         matched_person_ids = set()
         for i, detection_idx in zip(row_ind, col_ind):
             person_id = list(predictions.keys())[i]
-            if cost_matrix[i, detection_idx] < 150:  # Adjust threshold as needed
+            if cost_matrix[i, detection_idx] < 50:  # Increased threshold
                 self.update_person(person_id, frame_num, detection_idx)
                 matched_person_ids.add(person_id)
             else:
-                self.create_new_person(frame_num, detection_idx)
+                # Only create a new person if the detection is far from all existing persons
+                if np.all(cost_matrix[:, detection_idx] > 100):
+                    self.create_new_person(frame_num, detection_idx)
 
-        unmatched_detections = set(range(len(current_detections))) - set(col_ind)
-        for detection_idx in unmatched_detections:
-            self.create_new_person(frame_num, detection_idx)
+        # Update age for all trackers and remove old ones
+        for person_id in list(self.person_trackers.keys()):
+            if person_id not in matched_person_ids:
+                self.person_trackers[person_id]['age'] += 1
+                if self.person_trackers[person_id]['age'] > self.max_age:
+                    del self.person_trackers[person_id]
+            else:
+                self.person_trackers[person_id]['age'] = 0
 
-        # Remove trackers for persons not seen in this frame
-        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items() if
-                                pid in matched_person_ids}
+    @staticmethod
+    def calculate_distance(prediction, detection, kf):
+        diff = detection[:5] - prediction[:5]  # Exclude dummy variable
+        try:
+            S = kf.S[:5, :5]  # Covariance of the observation
+            SI = np.linalg.inv(S)
+            distance = mahalanobis(diff, np.zeros_like(diff), SI)
+        except np.linalg.LinAlgError:
+            # Fallback to Euclidean distance if Mahalanobis fails
+            distance = np.linalg.norm(diff)
+        return distance
 
     def update_person(self, person_id, frame_num, detection_idx):
         detection = self.pose_mask_associations[frame_num]['detections'][detection_idx]
@@ -273,8 +288,13 @@ class PersonSegmentation:
         # Add a dummy variable to match the Kalman filter's expected 6-dimensional input
         measurement = np.array([x, y, w, h, c, 0])
         self.person_trackers[person_id]['kf'].update(measurement)
+
+        # Add small regularization term
+        self.person_trackers[person_id]['kf'].P += np.eye(10) * 0.01
+
         self.person_trackers[person_id]['last_seen'] = frame_num
         self.person_trackers[person_id]['color_history'].append(color)
+        self.person_trackers[person_id]['age'] = 0
 
         if person_id not in self.person_reid:
             self.person_reid[person_id] = {}
@@ -288,6 +308,10 @@ class PersonSegmentation:
         # Initial tracking using Kalman Filter
         for frame_num, frame_data in self.pose_mask_associations.items():
             self.perform_reid_for_frame(frame_num)
+
+        # Remove short tracks (likely false positives)
+        min_track_length = 5
+        self.person_reid = {pid: frames for pid, frames in self.person_reid.items() if len(frames) >= min_track_length}
 
         # Color-based clustering and refinement
         self.refine_reid_with_color_clustering()
