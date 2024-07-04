@@ -182,17 +182,30 @@ class PersonSegmentation:
         person_id = f"person_{self.max_person_id}"
         detection = self.pose_mask_associations[frame_num]['detections'][detection_index]
 
-        kf = KalmanFilter(dim_x=4, dim_z=2)
-        kf.F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]])
-        kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
+        kf = KalmanFilter(dim_x=8, dim_z=4)  # State: [x, y, w, h, dx, dy, dw, dh]
+        kf.F = np.array([[1, 0, 0, 0, 1, 0, 0, 0],
+                         [0, 1, 0, 0, 0, 1, 0, 0],
+                         [0, 0, 1, 0, 0, 0, 1, 0],
+                         [0, 0, 0, 1, 0, 0, 0, 1],
+                         [0, 0, 0, 0, 1, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 1, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 1, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 1]])
+        kf.H = np.array([[1, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 1, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 1, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 1, 0, 0, 0, 0]])
         kf.R *= 10
-        kf.Q *= 0.1
+        kf.Q[4:, 4:] *= 0.01
 
-        center_x = (detection[0] + detection[2]) / 2
-        center_y = (detection[1] + detection[3]) / 2
-        kf.x = np.array([center_x, center_y, 0, 0])
+        x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
+        kf.x = np.array([x, y, w, h, 0, 0, 0, 0])
 
-        self.person_trackers[person_id] = {'kf': kf, 'last_seen': frame_num}
+        self.person_trackers[person_id] = {
+            'kf': kf,
+            'last_seen': frame_num,
+            'color_history': [self.pose_mask_associations[frame_num]['colors'][detection_index]]
+        }
 
         if person_id not in self.person_reid:
             self.person_reid[person_id] = {}
@@ -207,22 +220,20 @@ class PersonSegmentation:
 
     def predict_and_match(self, frame_num):
         current_detections = self.pose_mask_associations[frame_num]['detections']
-        detection_centers = np.array([(d[0] + d[2]) / 2 for d in current_detections])
-        detection_centers = np.column_stack((detection_centers, [(d[1] + d[3]) / 2 for d in current_detections]))
+        detection_features = np.array([[d[0], d[1], d[2] - d[0], d[3] - d[1]] for d in current_detections])
 
         predictions = {}
         for person_id, tracker in self.person_trackers.items():
             tracker['kf'].predict()
-            predictions[person_id] = tracker['kf'].x[:2]
+            predictions[person_id] = tracker['kf'].x[:4]
 
         if not predictions:
-            # If there are no existing tracks, create new persons for all detections
             for detection_idx in range(len(current_detections)):
                 self.create_new_person(frame_num, detection_idx)
             return
 
         prediction_array = np.array(list(predictions.values()))
-        cost_matrix = cdist(prediction_array, detection_centers)
+        cost_matrix = cdist(prediction_array, detection_features)
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
@@ -235,22 +246,21 @@ class PersonSegmentation:
             else:
                 self.create_new_person(frame_num, detection_idx)
 
-        # Handle unmatched detections
         unmatched_detections = set(range(len(current_detections))) - set(col_ind)
         for detection_idx in unmatched_detections:
             self.create_new_person(frame_num, detection_idx)
 
-        # Remove trackers for persons not seen in this frame
-        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items() if
-                                pid in matched_person_ids}
+        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items() if pid in matched_person_ids}
 
     def update_person(self, person_id, frame_num, detection_idx):
         detection = self.pose_mask_associations[frame_num]['detections'][detection_idx]
-        center_x = (detection[0] + detection[2]) / 2
-        center_y = (detection[1] + detection[3]) / 2
+        x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
 
-        self.person_trackers[person_id]['kf'].update(np.array([center_x, center_y]))
+        self.person_trackers[person_id]['kf'].update(np.array([x, y, w, h]))
         self.person_trackers[person_id]['last_seen'] = frame_num
+        self.person_trackers[person_id]['color_history'].append(
+            self.pose_mask_associations[frame_num]['colors'][detection_idx]
+        )
 
         if person_id not in self.person_reid:
             self.person_reid[person_id] = {}
@@ -282,15 +292,27 @@ class PersonSegmentation:
 
         color_features = np.array(color_features)
 
+        # Estimate the number of clusters based on the average number of people per frame
+        n_people_per_frame = [len(frame_data['detections']) for frame_data in self.pose_mask_associations.values()]
+        avg_people = max(5, int(np.mean(n_people_per_frame)))  # At least 5 clusters
+
         # Perform DBSCAN clustering
         clustering = DBSCAN(eps=0.1, min_samples=3).fit(color_features)
         labels = clustering.labels_
 
+        # If DBSCAN produces too many clusters, use KMeans
+        if len(set(labels)) - (1 if -1 in labels else 0) > avg_people * 1.5:
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=avg_people).fit(color_features)
+            labels = kmeans.labels_
+
         new_person_reid = {}
         for (old_person_id, frame_num, idx), label in zip(person_frames, labels):
             if label == -1:
-                continue  # Skip noise points
-            new_person_id = f"person_{label}"
+                new_person_id = old_person_id  # Keep original ID for noise points
+            else:
+                new_person_id = f"person_{label}"
+
             if new_person_id not in new_person_reid:
                 new_person_reid[new_person_id] = {}
             if frame_num not in new_person_reid[new_person_id]:
