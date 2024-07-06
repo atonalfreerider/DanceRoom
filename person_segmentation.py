@@ -7,12 +7,12 @@ import os
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from filterpy.kalman import KalmanFilter
+import glob
 
 
 class PersonSegmentation:
     def __init__(self, output_dir):
-        self.yolo_model = YOLO('yolov8x-pose-p6.pt')
-        self.sam_predictor = self.initialize_sam()
+        self.sam_predictor = None
         self.output_dir = output_dir
         self.mask_dir = os.path.join(output_dir, 'masks')
         os.makedirs(self.mask_dir, exist_ok=True)
@@ -28,9 +28,9 @@ class PersonSegmentation:
         self.person_trackers = {}
         self.max_person_id = 0
         self.load_cached_data()
-        self.max_age = 60  # Increase max age to allow for longer occlusions
-        self.min_hits = 3  # Minimum number of detections before considering a track valid
-        self.max_persons = 8  # Maximum number of persons to track simultaneously
+        self.max_age = 60
+        self.min_hits = 3
+        self.max_persons = 8
 
     #region INITIALIZATION
 
@@ -66,41 +66,16 @@ class PersonSegmentation:
     #region VIDEO LOOP
 
     def process_video(self, input_path, force_reprocess=False):
-        if not force_reprocess and self.detections and self.pose_mask_associations:
-            print("Using cached detections and pose-mask associations.")
-        else:
-            self.detections = []
-            self.pose_mask_associations = {}
+        # Step 1: Perform detections
+        self.perform_detections(input_path, force_reprocess)
 
-            cap = cv2.VideoCapture(input_path)
-            if not cap.isOpened():
-                print(f"Error: Unable to open the input video at {input_path}")
-                return False
-
-            frame_num = 0
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                bg_only, mask = self.process_frame(frame, frame_num)
-
-                # Store detections
-                self.detections.append(self.pose_mask_associations[frame_num]['detections'])
-
-                frame_num += 1
-                if frame_num % 100 == 0:
-                    print(f"Processed {frame_num} frames")
-
-            cap.release()
-
-            # Save detections and pose-mask associations
-            self.save_data()
+        # Step 2: Perform segmentation
+        self.perform_segmentation(input_path, force_reprocess)
 
         if not self.person_reid or force_reprocess:
             print("Performing ReID...")
             self.perform_reid()
-            self.save_data()  # Save updated ReID data
+            self.save_data()
         else:
             print("Using cached person ReID data.")
 
@@ -112,21 +87,105 @@ class PersonSegmentation:
         print(f"ReID video saved to: {self.reid_video_path}")
         return True
 
-    def process_frame(self, frame, frame_num):
+    def perform_detections(self, input_path, force_reprocess=False):
+        if not force_reprocess and os.path.exists(self.detection_file):
+            print("Using cached detections.")
+            with open(self.detection_file, 'r') as f:
+                self.detections = json.load(f)
+            return
+
+        yolo_model = YOLO('yolov8x-pose-p6.pt')
+        self.detections = []
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            print(f"Error: Unable to open the input video at {input_path}")
+            return False
+
+        frame_num = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            results = yolo_model(frame)
+            frame_detections = []
+            frame_keypoints = []
+            for r in results:
+                for box, kps in zip(r.boxes.data, r.keypoints.data):
+                    x1, y1, x2, y2, score, class_id = box.tolist()
+                    if class_id == 0:  # Ensure it's a person
+                        frame_detections.append([x1, y1, x2, y2])
+                        frame_keypoints.append(kps.tolist())
+
+            self.detections.append({
+                'detections': frame_detections,
+                'keypoints': frame_keypoints
+            })
+
+            frame_num += 1
+            if frame_num % 100 == 0:
+                print(f"Processed {frame_num} frames for detection")
+
+        cap.release()
+
+        # Save detections
+        with open(self.detection_file, 'w') as f:
+            json.dump(self.detections, f, indent=2)
+        print(f"Saved {len(self.detections)} detections to {self.detection_file}")
+
+    def perform_segmentation(self, input_path, force_reprocess=False):
+        # Determine the starting frame
+        existing_masks = glob.glob(os.path.join(self.mask_dir, 'mask_??????.png'))
+        start_frame = len(existing_masks)
+
+        # if start_frame is the last frame of the video, then we are done
+        cap = cv2.VideoCapture(input_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        if not force_reprocess and start_frame == total_frames:
+            print("Segmentation already completed for all frames.")
+            return
+
+        if not force_reprocess and start_frame > 0:
+            print(f"Continuing segmentation from frame {start_frame}")
+        else:
+            start_frame = 0
+            self.pose_mask_associations = {}
+
+        self.sam_predictor = self.initialize_sam()
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            print(f"Error: Unable to open the input video at {input_path}")
+            return False
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frame_num = start_frame
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            self.segment_frame_and_match(frame, frame_num)
+
+            frame_num += 1
+            if frame_num % 100 == 0:
+                print(f"Processed {frame_num} frames for segmentation")
+
+        cap.release()
+
+        # Save pose-mask associations
+        self.save_data()
+
+    def segment_frame_and_match(self, frame, frame_num):
         composite_mask_file = os.path.join(self.mask_dir, f'mask_{frame_num:06d}.png')
-        frame_detections = []
         frame_masks = []
         frame_colors = []
-        frame_keypoints = []
 
-        # YOLO detection and pose estimation
-        results = self.yolo_model(frame)
-        for r in results:
-            for box, kps in zip(r.boxes.data, r.keypoints.data):
-                x1, y1, x2, y2, score, class_id = box.tolist()
-                if class_id == 0:  # Ensure it's a person
-                    frame_detections.append([x1, y1, x2, y2])
-                    frame_keypoints.append(kps.tolist())
+        # Use pre-computed detections
+        frame_detections = self.detections[frame_num]['detections']
+        frame_keypoints = self.detections[frame_num]['keypoints']
 
         # SAM segmentation
         self.sam_predictor.set_image(frame)
@@ -169,11 +228,6 @@ class PersonSegmentation:
 
         # Apply mask to original frame
         bg_only = cv2.bitwise_and(frame, frame, mask=bg_mask)
-
-        # Perform ReID immediately after detection
-        self.perform_reid_for_frame(frame_num)
-
-        return bg_only, composite_mask
 
     #endregion
 

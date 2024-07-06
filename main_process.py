@@ -1,11 +1,9 @@
 import os
+import argparse
 from person_segmentation import PersonSegmentation
 from room_tracker import detect_lines_and_axes
 
-
-def main():
-    input_video = '/home/john/Downloads/carlos-aline-spin-cam1.mp4'
-    output_dir = '/home/john/Desktop/out'  # Replace with your desired output directory
+def main(input_video, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: Segment people, create background-only video, and save masks and poses
@@ -24,6 +22,10 @@ def main():
     else:
         print(f"Error: Background video not found at {bg_video_path}")
 
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Process video for person segmentation and room orientation.")
+    parser.add_argument("input_video", help="Path to the input video file")
+    parser.add_argument("output_dir", help="Path to the output directory")
+    args = parser.parse_args()
+
+    main(args.input_video, args.output_dir)
