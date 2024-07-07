@@ -4,535 +4,453 @@ from ultralytics import YOLO
 from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
-from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist
-from filterpy.kalman import KalmanFilter
 import glob
+import matplotlib.pyplot as plt
 
 
-class PersonSegmentation:
-    def __init__(self, output_dir):
-        self.sam_predictor = None
+class DanceSegmentation:
+    def __init__(self, input_path, output_dir):
+        self.input_path = input_path
         self.output_dir = output_dir
         self.mask_dir = os.path.join(output_dir, 'masks')
+        self.depth_dir = os.path.join(output_dir, 'depth')
         os.makedirs(self.mask_dir, exist_ok=True)
-        self.detections = []
-        self.detection_file = os.path.join(output_dir, 'detections.json')
-        self.bg_video_path = os.path.join(output_dir, 'background_only.mp4')
-        self.reid_video_path = os.path.join(output_dir, 'reid_video.mp4')
-        self.pose_mask_associations = {}
-        self.pose_mask_file = os.path.join(output_dir, 'pose_mask_associations.json')
-        self.person_reid = {}
-        self.person_reid_file = os.path.join(output_dir, 'person_reid.json')
-        self.kalman_filters = {}
-        self.person_trackers = {}
-        self.max_person_id = 0
-        self.load_cached_data()
-        self.max_age = 60
-        self.min_hits = 3
-        self.max_persons = 8
 
-    #region INITIALIZATION
+        self.men_women_file = os.path.join(output_dir, 'men-women.json')
+        self.detections_file = os.path.join(output_dir, 'detections.json')
+        self.lead_file = os.path.join(output_dir, 'lead.json')
+        self.follow_file = os.path.join(output_dir, 'follow.json')
+
+        self.men_women = self.load_json(self.men_women_file)
+        self.detections = self.load_json(self.detections_file)
+        self.lead = self.load_json(self.lead_file)
+        self.follow = self.load_json(self.follow_file)
+
+        self.sam_predictor = None
+
+    def process_video(self):
+        self.detect_men_women()
+        self.detect_poses()
+        self.match_poses_and_identify_leads()
+        # self.segment_leads()
+        self.generate_debug_video()
+        print("Video processing complete.")
+
+    def detect_men_women(self):
+        if self.men_women:
+            print("Using cached men-women detections.")
+            return
+
+        model = YOLO('yolov8x-man-woman.pt')
+        cap = cv2.VideoCapture(self.input_path)
+        frame_count = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            results = model(frame)
+            men = []
+            women = []
+
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    conf = box.conf.item()
+                    cls = box.cls.item()
+                    if cls == 0:  # Assuming 0 is the class for men
+                        men.append([x1, y1, x2, y2, conf])
+                    elif cls == 1:  # Assuming 1 is the class for women
+                        women.append([x1, y1, x2, y2, conf])
+
+            self.men_women[frame_count] = {'men': men, 'women': women}
+            frame_count += 1
+
+        cap.release()
+        self.save_json(self.men_women, self.men_women_file)
+        print(f"Saved men-women detections for {frame_count} frames.")
+
+    def detect_poses(self):
+        if self.detections:
+            print("Using cached pose detections.")
+            return
+
+        model = YOLO('yolov8x-pose-p6.pt')
+        cap = cv2.VideoCapture(self.input_path)
+        frame_count = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            results = model(frame)
+            poses = []
+
+            for r in results:
+                for pose in r.keypoints.data:
+                    poses.append(pose.tolist())
+
+            self.detections[frame_count] = poses
+            frame_count += 1
+
+        cap.release()
+        self.save_json(self.detections, self.detections_file)
+        print(f"Saved pose detections for {frame_count} frames.")
+
+    def match_poses_and_identify_leads(self):
+        if self.lead and self.follow:
+            print("Using cached lead and follow data.")
+            return
+
+        cap = cv2.VideoCapture(self.input_path)
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+
+        for frame_num in self.men_women.keys():
+            depth_map = self.load_depth_map(int(frame_num))
+            if depth_map is None:
+                continue
+
+            men = self.men_women[frame_num]['men']
+            women = self.men_women[frame_num]['women']
+            poses = self.detections.get(frame_num, [])
+
+            # Calculate scores, depths, sizes, and genders for all poses
+            pose_data = []
+            for pose in poses:
+                score, avg_depth, size = self.calculate_pose_score(pose, depth_map, frame_width, frame_height)
+                gender = 'man' if self.pose_in_boxes(pose, men) else 'woman' if self.pose_in_boxes(pose,
+                                                                                                   women) else 'neutral'
+                pose_size = self.calculate_pose_size(pose)
+                pose_data.append((pose, score, avg_depth, size, gender, pose_size))
+
+            # Sort poses by depth (closest first)
+            pose_data.sort(key=lambda x: x[2])
+
+            # Get the two closest poses
+            closest_poses = pose_data[:2] if len(pose_data) >= 2 else pose_data
+
+            lead = None
+            follow = None
+
+            if len(closest_poses) == 2:
+                if closest_poses[0][4] == 'man' and closest_poses[1][4] == 'man':
+                    # Two closest are men, larger is lead, smaller is follow
+                    if closest_poses[0][5] > closest_poses[1][5]:
+                        lead, follow = closest_poses[0], closest_poses[1]
+                    else:
+                        lead, follow = closest_poses[1], closest_poses[0]
+                elif closest_poses[0][4] == 'woman' and closest_poses[1][4] == 'woman':
+                    # Two closest are women, larger is lead, smaller is follow
+                    if closest_poses[0][5] > closest_poses[1][5]:
+                        lead, follow = closest_poses[0], closest_poses[1]
+                    else:
+                        lead, follow = closest_poses[1], closest_poses[0]
+                else:
+                    # One man and one woman, or other combinations
+                    lead = next((p for p in closest_poses if p[4] == 'man'), None)
+                    follow = next((p for p in closest_poses if p[4] == 'woman'), None)
+
+                    # If we don't have both lead and follow, assign based on depth
+                    if not lead and not follow:
+                        lead, follow = closest_poses[0], closest_poses[1]
+                    elif not lead:
+                        lead = [p for p in closest_poses if p != follow][0]
+                    elif not follow:
+                        follow = [p for p in closest_poses if p != lead][0]
+            elif len(closest_poses) == 1:
+                lead = closest_poses[0]
+
+            # Convert to 3D keypoints
+            if lead:
+                self.lead[frame_num] = self.get_3d_keypoints(lead[0], depth_map, frame_width, frame_height)
+            if follow:
+                self.follow[frame_num] = self.get_3d_keypoints(follow[0], depth_map, frame_width, frame_height)
+
+        self.save_json(self.lead, self.lead_file)
+        self.save_json(self.follow, self.follow_file)
+        print("Saved lead and follow data.")
 
     @staticmethod
-    def initialize_sam():
-        sam = sam_model_registry["default"](checkpoint="sam_vit_h_4b8939.pth")
-        return SamPredictor(sam)
+    def calculate_pose_size(pose):
+        head_keypoints = [0, 1, 2, 3, 4]  # Nose, left eye, right eye, left ear, right ear
+        foot_keypoints = [15, 16]  # Left ankle, right ankle
 
-    def load_cached_data(self):
-        if os.path.exists(self.detection_file):
-            with open(self.detection_file, 'r') as f:
-                self.detections = json.load(f)
-            print(f"Loaded {len(self.detections)} cached detections.")
+        head_y = min([pose[i][1] for i in head_keypoints if i < len(pose) and len(pose[i]) > 2 and pose[i][2] > 0],
+                     default=None)
+        foot_y = max([pose[i][1] for i in foot_keypoints if i < len(pose) and len(pose[i]) > 2 and pose[i][2] > 0],
+                     default=None)
+
+        if head_y is not None and foot_y is not None:
+            return foot_y - head_y
         else:
-            print("No cached detections found.")
+            return 0  # Return 0 if we can't calculate the size
 
-        if os.path.exists(self.pose_mask_file):
-            with open(self.pose_mask_file, 'r') as f:
-                self.pose_mask_associations = json.load(f)
-            print(f"Loaded pose-mask associations for {len(self.pose_mask_associations)} frames.")
+    @staticmethod
+    def calculate_pose_score(pose, depth_map, frame_width, frame_height):
+        pose_depths = []
+        pose_confidences = []
+        valid_keypoints = []
+        for kp in pose:
+            x, y, conf = kp[0], kp[1], kp[2]
+            if conf > 0:
+                x_scaled = int(x * 640 / frame_width)
+                y_scaled = int(y * 480 / frame_height)
+                if 0 <= x_scaled < 640 and 0 <= y_scaled < 480:
+                    pose_depths.append(depth_map[y_scaled, x_scaled])
+                    pose_confidences.append(conf)
+                    valid_keypoints.append((x, y))
+
+        if not pose_depths:
+            return 0, float('inf'), 0
+
+        avg_depth = np.mean(pose_depths)
+        avg_confidence = np.mean(pose_confidences)
+
+        # Calculate pose size (bounding box area)
+        if valid_keypoints:
+            x_coords, y_coords = zip(*valid_keypoints)
+            size = (max(x_coords) - min(x_coords)) * (max(y_coords) - min(y_coords))
         else:
-            print("No cached pose-mask associations found.")
+            size = 0
 
-        if os.path.exists(self.person_reid_file):
-            with open(self.person_reid_file, 'r') as f:
-                self.person_reid = json.load(f)
-            print(f"Loaded person ReID data for {len(self.person_reid)} persons.")
-        else:
-            print("No cached person ReID data found.")
+        # Calculate a score that favors closer poses with higher confidence
+        score = avg_confidence / (avg_depth + 1e-6)  # Add small epsilon to avoid division by zero
+        return score, avg_depth, size
 
-    #endregion
-
-    #region VIDEO LOOP
-
-    def process_video(self, input_path, force_reprocess=False):
-        # Step 1: Perform detections
-        self.perform_detections(input_path, force_reprocess)
-
-        # Step 2: Perform segmentation
-        self.perform_segmentation(input_path, force_reprocess)
-
-        if not self.person_reid or force_reprocess:
-            print("Performing ReID...")
-            self.perform_reid()
-            self.save_data()
-        else:
-            print("Using cached person ReID data.")
-
-        print("Generating ReID video...")
-        self.generate_reid_video(input_path)
-
-        print(f"Processing complete.")
-        print(f"Background video saved to: {self.bg_video_path}")
-        print(f"ReID video saved to: {self.reid_video_path}")
-        return True
-
-    def perform_detections(self, input_path, force_reprocess=False):
-        if not force_reprocess and os.path.exists(self.detection_file):
-            print("Using cached detections.")
-            with open(self.detection_file, 'r') as f:
-                self.detections = json.load(f)
-            return
-
-        yolo_model = YOLO('yolov8x-pose-p6.pt')
-        self.detections = []
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            print(f"Error: Unable to open the input video at {input_path}")
+    @staticmethod
+    def pose_in_boxes(pose, boxes):
+        valid_points = [p for p in pose if p[2] > 0]  # Consider only points with confidence > 0
+        if not valid_points:
             return False
+        x_coords, y_coords, _ = zip(*valid_points)
+        pose_center_x = sum(x_coords) / len(x_coords)
+        pose_center_y = sum(y_coords) / len(y_coords)
+        return any(box[0] <= pose_center_x <= box[2] and box[1] <= pose_center_y <= box[3] for box in boxes)
 
-        frame_num = 0
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    @staticmethod
+    def get_3d_keypoints(pose, depth_map, frame_width, frame_height):
+        keypoints_3d = []
+        for kp in pose:
+            x, y, conf = kp
+            if x == 0 and y == 0:  # Disregard [0, 0] points
+                keypoints_3d.append([x, y, 0, 0])  # Add a zero-confidence point
+                continue
+            x_scaled = int(x * 640 / frame_width)
+            y_scaled = int(y * 480 / frame_height)
+            if 0 <= x_scaled < 640 and 0 <= y_scaled < 480:
+                z = float(depth_map[y_scaled, x_scaled])  # Convert to float
+                keypoints_3d.append([float(x), float(y), z, float(conf)])  # Convert all to float
+            else:
+                keypoints_3d.append([float(x), float(y), 0, float(conf)])  # Convert all to float
+        return keypoints_3d
 
-            results = yolo_model(frame)
-            frame_detections = []
-            frame_keypoints = []
-            for r in results:
-                for box, kps in zip(r.boxes.data, r.keypoints.data):
-                    x1, y1, x2, y2, score, class_id = box.tolist()
-                    if class_id == 0:  # Ensure it's a person
-                        frame_detections.append([x1, y1, x2, y2])
-                        frame_keypoints.append(kps.tolist())
+    def segment_leads(self):
+        if not self.sam_predictor:
+            sam = sam_model_registry["default"](checkpoint="sam_vit_h_4b8939.pth")
+            self.sam_predictor = SamPredictor(sam)
 
-            self.detections.append({
-                'detections': frame_detections,
-                'keypoints': frame_keypoints
-            })
+        cap = cv2.VideoCapture(self.input_path)
 
-            frame_num += 1
-            if frame_num % 100 == 0:
-                print(f"Processed {frame_num} frames for detection")
-
-        cap.release()
-
-        # Save detections
-        with open(self.detection_file, 'w') as f:
-            json.dump(self.detections, f, indent=2)
-        print(f"Saved {len(self.detections)} detections to {self.detection_file}")
-
-    def perform_segmentation(self, input_path, force_reprocess=False):
-        # Determine the starting frame
-        existing_masks = glob.glob(os.path.join(self.mask_dir, 'mask_??????.png'))
+        existing_masks = glob.glob(os.path.join(self.mask_dir, 'mask_lead_??????.png'))
         start_frame = len(existing_masks)
 
-        # if start_frame is the last frame of the video, then we are done
-        cap = cv2.VideoCapture(input_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        if not force_reprocess and start_frame == total_frames:
-            print("Segmentation already completed for all frames.")
-            return
-
-        if not force_reprocess and start_frame > 0:
-            print(f"Continuing segmentation from frame {start_frame}")
-        else:
-            start_frame = 0
-            self.pose_mask_associations = {}
-
-        self.sam_predictor = self.initialize_sam()
-
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            print(f"Error: Unable to open the input video at {input_path}")
-            return False
-
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frame_num = start_frame
+        frame_count = start_frame
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            self.segment_frame_and_match(frame, frame_num)
+            lead_pose = self.lead.get(str(frame_count))
+            follow_pose = self.follow.get(str(frame_count))
 
-            frame_num += 1
-            if frame_num % 100 == 0:
-                print(f"Processed {frame_num} frames for segmentation")
+            if lead_pose:
+                self.segment_person(frame, lead_pose, frame_count, 'lead')
+            if follow_pose:
+                self.segment_person(frame, follow_pose, frame_count, 'follow')
+
+            frame_count += 1
+            if frame_count % 100 == 0:
+                print(f"Processed {frame_count} frames for segmentation")
 
         cap.release()
 
-        # Save pose-mask associations
-        self.save_data()
-
-    def segment_frame_and_match(self, frame, frame_num):
-        composite_mask_file = os.path.join(self.mask_dir, f'mask_{frame_num:06d}.png')
-        frame_masks = []
-        frame_colors = []
-
-        # Use pre-computed detections
-        frame_detections = self.detections[frame_num]['detections']
-        frame_keypoints = self.detections[frame_num]['keypoints']
-
-        # SAM segmentation
+    def segment_person(self, frame, pose, frame_num, person_type):
         self.sam_predictor.set_image(frame)
-        composite_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 
-        for i, (box, keypoints) in enumerate(zip(frame_detections, frame_keypoints)):
-            box_array = np.array(box)
-            masks, _, _ = self.sam_predictor.predict(
-                box=box_array,
-                multimask_output=False
-            )
-            mask = masks[0].astype(np.uint8)
-
-            # Save individual mask
-            individual_mask_file = os.path.join(self.mask_dir, f'mask_{frame_num:06d}-{i}.png')
-            cv2.imwrite(individual_mask_file, mask * 255)
-
-            # Update composite mask
-            composite_mask = np.logical_or(composite_mask, mask).astype(np.uint8)
-
-            # Calculate body part colors
-            body_part_colors = self.get_body_part_colors(frame, mask, keypoints)
-
-            frame_masks.append(individual_mask_file)
-            frame_colors.append(body_part_colors)
-
-        # Save composite mask
-        cv2.imwrite(composite_mask_file, composite_mask * 255)
-
-        # Update pose-mask associations
-        self.pose_mask_associations[frame_num] = {
-            'detections': frame_detections,
-            'masks': frame_masks,
-            'colors': frame_colors,
-            'keypoints': frame_keypoints
-        }
-
-        # Invert mask to get background
-        bg_mask = cv2.bitwise_not(composite_mask * 255)
-
-        # Apply mask to original frame
-        bg_only = cv2.bitwise_and(frame, frame, mask=bg_mask)
-
-    #endregion
-
-    #region ReID
-
-    def create_new_person(self, frame_num, detection_index):
-        if len(self.person_trackers) >= self.max_persons:
+        # Get bounding box from pose
+        x_coords = [kp[0] for kp in pose if kp[3] > 0.5]  # Only consider high confidence keypoints
+        y_coords = [kp[1] for kp in pose if kp[3] > 0.5]
+        if not x_coords or not y_coords:
             return
 
-        self.max_person_id += 1
-        person_id = f"person_{self.max_person_id}"
-        detection = self.pose_mask_associations[frame_num]['detections'][detection_index]
-        color = self.pose_mask_associations[frame_num]['colors'][detection_index]
+        x1, y1 = min(x_coords), min(y_coords)
+        x2, y2 = max(x_coords), max(y_coords)
 
-        kf = KalmanFilter(dim_x=6, dim_z=5)  # State: [x, y, w, h, c, v]
-        kf.F = np.eye(6)
-        kf.F[:5, 5] = 1  # velocity component
-        kf.H = np.eye(5, 6)
-        kf.R *= 10
-        kf.Q[-1, -1] *= 0.01  # small changes in velocity
+        box = np.array([x1, y1, x2, y2])
+        masks, _, _ = self.sam_predictor.predict(box=box, multimask_output=False)
+        mask = masks[0].astype(np.uint8)
 
-        x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
-        c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
-        kf.x = np.array([x, y, w, h, c, 0])
+        mask_file = os.path.join(self.mask_dir, f'mask_{person_type}_{frame_num:06d}.png')
+        cv2.imwrite(mask_file, mask * 255)
 
-        self.person_trackers[person_id] = {
-            'kf': kf,
-            'last_seen': frame_num,
-            'color_history': [color],
-            'age': 0,
-            'hits': 1
-        }
+    #region UTILITY
 
-        if person_id not in self.person_reid:
-            self.person_reid[person_id] = {}
-        self.person_reid[person_id][frame_num] = [detection_index]
+    @staticmethod
+    def load_json(file_path):
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        return {}
 
-    def perform_reid_for_frame(self, frame_num):
-        if frame_num == 0:
-            for i in range(len(self.pose_mask_associations[0]['detections'])):
-                self.create_new_person(0, i)
+    def load_depth_map(self, frame_num):
+        depth_file = os.path.join(self.depth_dir, f'{frame_num:06d}.npz')
+        if os.path.exists(depth_file):
+            with np.load(depth_file) as data:
+                # Try to get the first key in the archive
+                keys = list(data.keys())
+                if keys:
+                    return data[keys[0]]
+                else:
+                    print(f"Warning: No data found in {depth_file}")
+                    return None
         else:
-            self.predict_and_match(frame_num)
+            print(f"Warning: Depth file not found: {depth_file}")
+            return None
 
-    def predict_and_match(self, frame_num):
-        current_detections = self.pose_mask_associations[frame_num]['detections']
-        current_colors = self.pose_mask_associations[frame_num]['colors']
-
-        detection_features = []
-        for d, c in zip(current_detections, current_colors):
-            x, y, w, h = d[0], d[1], d[2] - d[0], d[3] - d[1]
-            color = np.mean([np.mean(c['chest_back']), np.mean(c['legs']), np.mean(c['arms'])])
-            detection_features.append([x, y, w, h, color])
-        detection_features = np.array(detection_features)
-
-        predictions = {}
-        for person_id, tracker in self.person_trackers.items():
-            tracker['kf'].predict()
-            predictions[person_id] = tracker['kf'].x[:5]  # x, y, w, h, color
-
-        if not predictions:
-            for detection_idx in range(len(current_detections)):
-                self.create_new_person(frame_num, detection_idx)
-            return
-
-        cost_matrix = cdist(np.array(list(predictions.values())), detection_features)
-
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        matched_person_ids = set()
-        for i, detection_idx in zip(row_ind, col_ind):
-            person_id = list(predictions.keys())[i]
-            if cost_matrix[i, detection_idx] < 100:  # Adjust this threshold as needed
-                self.update_person(person_id, frame_num, detection_idx)
-                matched_person_ids.add(person_id)
-            else:
-                if len(self.person_trackers) < self.max_persons:
-                    self.create_new_person(frame_num, detection_idx)
-
-        # Update age for all trackers and remove old ones
-        for person_id in list(self.person_trackers.keys()):
-            if person_id not in matched_person_ids:
-                self.person_trackers[person_id]['age'] += 1
-                if self.person_trackers[person_id]['age'] > self.max_age:
-                    del self.person_trackers[person_id]
-            else:
-                self.person_trackers[person_id]['age'] = 0
-                self.person_trackers[person_id]['hits'] += 1
-
-        # Remove trackers that haven't been matched enough times
-        self.person_trackers = {pid: tracker for pid, tracker in self.person_trackers.items()
-                                if tracker['hits'] >= self.min_hits}
-
-    def update_person(self, person_id, frame_num, detection_idx):
-        detection = self.pose_mask_associations[frame_num]['detections'][detection_idx]
-        color = self.pose_mask_associations[frame_num]['colors'][detection_idx]
-
-        x, y, w, h = detection[0], detection[1], detection[2] - detection[0], detection[3] - detection[1]
-        c = np.mean([np.mean(color['chest_back']), np.mean(color['legs']), np.mean(color['arms'])])
-
-        measurement = np.array([x, y, w, h, c])
-        self.person_trackers[person_id]['kf'].update(measurement)
-
-        self.person_trackers[person_id]['last_seen'] = frame_num
-        self.person_trackers[person_id]['color_history'].append(color)
-        self.person_trackers[person_id]['age'] = 0
-        self.person_trackers[person_id]['hits'] += 1
-
-        if person_id not in self.person_reid:
-            self.person_reid[person_id] = {}
-        self.person_reid[person_id][frame_num] = [detection_idx]
-
-    def perform_reid(self):
-        self.person_reid = {}
-        self.person_trackers = {}
-        self.max_person_id = 0
-
-        # Initial tracking using Kalman Filter
-        for frame_num, frame_data in self.pose_mask_associations.items():
-            self.perform_reid_for_frame(frame_num)
-
-        # Remove short tracks (likely false positives)
-        min_track_length = 10
-        self.person_reid = {pid: frames for pid, frames in self.person_reid.items() if len(frames) >= min_track_length}
-
-        # Merge similar tracks
-        self.merge_similar_tracks()
-
-    def merge_similar_tracks(self):
-        track_features = {}
-        for person_id, frames in self.person_reid.items():
-            colors = [self.pose_mask_associations[frame]['colors'][idx[0]] for frame, idx in frames.items()]
-            avg_color = np.mean([np.mean([c['chest_back'], c['legs'], c['arms']], axis=0) for c in colors], axis=0)
-            track_features[person_id] = avg_color
-
-        merged_ids = set()
-        for id1 in track_features:
-            if id1 in merged_ids:
-                continue
-            for id2 in track_features:
-                if id1 != id2 and id2 not in merged_ids:
-                    if np.linalg.norm(track_features[id1] - track_features[id2]) < 30:  # Adjust threshold as needed
-                        self.merge_tracks(id1, id2)
-                        merged_ids.add(id2)
-
-    def merge_tracks(self, id1, id2):
-        for frame, detections in self.person_reid[id2].items():
-            if frame in self.person_reid[id1]:
-                self.person_reid[id1][frame].extend(detections)
-            else:
-                self.person_reid[id1][frame] = detections
-        del self.person_reid[id2]
+    def save_json(self, data, file_path):
+        with open(file_path, 'w') as f:
+            json.dump(self.numpy_to_python(data), f, indent=2)
 
     #endregion
 
-    #region RENDER
+    #region DEBUG
 
-    def generate_reid_video(self, input_path):
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            print(f"Error: Unable to open the input video at {input_path}")
-            return False
+    def generate_debug_video(self):
+        debug_video_path = os.path.join(self.output_dir, 'debug_video.mp4')
+        cap = cv2.VideoCapture(self.input_path)
 
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(self.reid_video_path, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(debug_video_path, fourcc, fps, (frame_width, frame_height))
 
-        frame_num = 0
-        while True:
+        frame_count = 0
+        while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            reid_frame = self.render_reid_frame(frame, frame_num)
-            out.write(reid_frame)
+            depth_map = self.load_depth_map(frame_count)
+            if depth_map is None:
+                print(f"Skipping frame {frame_count} due to missing depth map")
+                frame_count += 1
+                continue
 
-            frame_num += 1
-            if frame_num % 100 == 0:
-                print(f"Rendered {frame_num} frames")
+            depth_pred_col = self.colorize(depth_map, vmin=0.01, vmax=10.0, cmap="magma_r")
+            depth_pred_col = cv2.resize(depth_pred_col, (frame_width, frame_height))
+            debug_frame = cv2.cvtColor(depth_pred_col, cv2.COLOR_RGB2BGR)
+
+            poses = self.detections.get(str(frame_count), [])
+            for pose in poses:
+                self.draw_pose(debug_frame, pose, (128, 128, 128))  # Gray for all poses
+
+            lead_pose = self.lead.get(str(frame_count))
+            if lead_pose:
+                self.draw_pose(debug_frame, lead_pose, (255, 0, 0), is_lead_or_follow=True)  # Blue for lead man
+
+            follow_pose = self.follow.get(str(frame_count))
+            if follow_pose:
+                self.draw_pose(debug_frame, follow_pose, (0, 255, 0), is_lead_or_follow=True)  # Green for follow woman
+
+            out.write(debug_frame)
+
+            frame_count += 1
+            if frame_count % 100 == 0:
+                print(f"Processed {frame_count}/{total_frames} frames for debug video")
 
         cap.release()
         out.release()
-        print(f"ReID video generated with {frame_num} frames.")
 
-    def render_reid_frame(self, frame, frame_num):
-        if str(frame_num) not in self.pose_mask_associations:
-            return frame
-
-        frame_data = self.pose_mask_associations[str(frame_num)]
-
-        for person_id, person_data in self.person_reid.items():
-            if str(frame_num) in person_data:
-                for detection_index in person_data[str(frame_num)]:
-                    detection = frame_data['detections'][detection_index]
-                    keypoints = frame_data['keypoints'][detection_index]
-                    colors = frame_data['colors'][detection_index]
-
-                    # Draw bounding box
-                    cv2.rectangle(frame, (int(detection[0]), int(detection[1])),
-                                  (int(detection[2]), int(detection[3])), (0, 255, 0), 2)
-
-                    # Draw ReID label
-                    cv2.putText(frame, person_id, (int(detection[0]), int(detection[1] - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-
-                    # Draw pose connections
-                    self.draw_pose_connections(frame, keypoints, colors)
-
-        return frame
-
-    #endregion
-
-    #region REFERENCE
+        if frame_count == 0:
+            print("Error: No frames were processed. Check your input video and depth maps.")
+        else:
+            print(f"Debug video saved to {debug_video_path} with {frame_count} frames")
 
     @staticmethod
-    def get_body_part_colors(frame, mask, keypoints):
-        # Define body parts
-        chest_back_indices = [5, 6, 11, 12]  # shoulders and hips
-        legs_indices = [13, 14, 15, 16]  # knees and ankles
-        arms_indices = [7, 8, 9, 10]  # elbows and wrists
-
-        def get_average_color(points):
-            colors = []
-            for x, y, conf in points:
-                if conf > 0.5:  # Only consider high confidence keypoints
-                    x, y = int(x), int(y)
-                    if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                        roi = frame[max(0, y - 10):min(frame.shape[0], y + 10),
-                              max(0, x - 10):min(frame.shape[1], x + 10)]
-                        roi_mask = mask[max(0, y - 10):min(frame.shape[0], y + 10),
-                                   max(0, x - 10):min(frame.shape[1], x + 10)]
-                        if roi.size > 0 and roi_mask.any():
-                            avg_color = np.mean(roi[roi_mask > 0], axis=0).tolist()
-                            colors.append(avg_color)
-            return np.mean(colors, axis=0) if colors else [0, 0, 0]
-
-        chest_back_color = get_average_color([keypoints[i] for i in chest_back_indices])
-        legs_color = get_average_color([keypoints[i] for i in legs_indices])
-        arms_color = get_average_color([keypoints[i] for i in arms_indices])
-
-        return {
-            'chest_back': chest_back_color,
-            'legs': legs_color,
-            'arms': arms_color
-        }
-
-    @staticmethod
-    def draw_pose_connections(frame, keypoints, colors):
+    def draw_pose(image, pose, color, is_lead_or_follow=False):
         connections = [
-            (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
-            (5, 6), (5, 11), (6, 12), (11, 12),  # Chest/Back
-            (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
+            (0, 1), (0, 2), (1, 3), (2, 4),  # Head
+            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
+            (5, 11), (6, 12), (11, 13), (12, 14), (13, 15), (14, 16)  # Legs
         ]
 
+        overlay = np.zeros_like(image, dtype=np.uint8)
+
+        def get_point_and_conf(kp):
+            if len(kp) == 4 and (kp[0] != 0 or kp[1] != 0):
+                return (int(kp[0]), int(kp[1])), kp[3]  # x, y, z, conf
+            elif len(kp) == 3 and (kp[0] != 0 or kp[1] != 0):
+                return (int(kp[0]), int(kp[1])), kp[2]  # x, y, conf
+            return None, 0.0
+
+        line_thickness = 3 if is_lead_or_follow else 1
+
         for connection in connections:
-            start_point = keypoints[connection[0]]
-            end_point = keypoints[connection[1]]
+            if len(pose) > max(connection):
+                start_point, start_conf = get_point_and_conf(pose[connection[0]])
+                end_point, end_conf = get_point_and_conf(pose[connection[1]])
 
-            if start_point[2] > 0.5 and end_point[2] > 0.5:
-                start_point = (int(start_point[0]), int(start_point[1]))
-                end_point = (int(end_point[0]), int(end_point[1]))
+                if start_point is not None and end_point is not None:
+                    avg_conf = (start_conf + end_conf) / 2
+                    color_with_alpha = tuple(int(c * avg_conf) for c in color)
+                    cv2.line(overlay, start_point, end_point, color_with_alpha, line_thickness)
 
-                if connection[0] in [5, 6, 11, 12] and connection[1] in [5, 6, 11, 12]:
-                    color = colors['chest_back']
-                elif connection[0] in [11, 12, 13, 14, 15, 16] and connection[1] in [11, 12, 13, 14, 15, 16]:
-                    color = colors['legs']
-                else:
-                    color = colors['arms']
+        for point in pose:
+            pt, conf = get_point_and_conf(point)
+            if pt is not None:
+                color_with_alpha = tuple(int(c * conf) for c in color)
+                cv2.circle(overlay, pt, 3, color_with_alpha, -1)
 
-                cv2.line(frame, start_point, end_point, color, 2)
+        cv2.add(image, overlay, image)
 
-    def numpy_to_list(self, obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64,
-                              np.uint8, np.uint16, np.uint32, np.uint64)):
+    @staticmethod
+    def colorize(value, vmin=None, vmax=None, cmap="magma_r"):
+        if value.ndim > 2:
+            if value.shape[-1] > 1:
+                return value
+            value = value[..., 0]
+        invalid_mask = value < 0.0001
+        vmin = value.min() if vmin is None else vmin
+        vmax = value.max() if vmax is None else vmax
+        value = (value - vmin) / (vmax - vmin)
+        cmapper = plt.get_cmap(cmap)
+        value = cmapper(value, bytes=True)
+        value[invalid_mask] = 0
+        img = value[..., :3]
+        return img
+
+    def numpy_to_python(self, obj):
+        if isinstance(obj, np.integer):
             return int(obj)
-        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        elif isinstance(obj, np.floating):
             return float(obj)
-        elif isinstance(obj, dict):
-            return {self.numpy_to_list(key): self.numpy_to_list(value) for key, value in obj.items()}
+        elif isinstance(obj, np.ndarray):
+            return self.numpy_to_python(obj.tolist())
         elif isinstance(obj, list):
-            return [self.numpy_to_list(item) for item in obj]
-        elif isinstance(obj, tuple):
-            return tuple(self.numpy_to_list(item) for item in obj)
+            return [self.numpy_to_python(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: self.numpy_to_python(value) for key, value in obj.items()}
         else:
             return obj
-
-    def save_data(self):
-        with open(self.detection_file, 'w') as f:
-            json.dump(self.numpy_to_list(self.detections), f, indent=2)
-        print(f"Saved {len(self.detections)} detections to {self.detection_file}")
-
-        with open(self.pose_mask_file, 'w') as f:
-            json.dump(self.numpy_to_list(self.pose_mask_associations), f, indent=2)
-        print(f"Saved pose-mask associations for {len(self.pose_mask_associations)} frames to {self.pose_mask_file}")
-
-        with open(self.person_reid_file, 'w') as f:
-            json.dump(self.numpy_to_list(self.person_reid), f, indent=2)
-        print(f"Saved person ReID data to {self.person_reid_file}")
-
-    def get_bg_video_path(self):
-        return self.bg_video_path
 
     #endregion
