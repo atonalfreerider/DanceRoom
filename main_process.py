@@ -1,13 +1,17 @@
 import os
 import argparse
 from person_segmentation import DanceSegmentation
+from person_tracking import PersonTracking
+
 
 def main(input_video, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: Segment people, create background-only video, and save masks and poses
-    segmentation = DanceSegmentation(input_video, output_dir)
-    segmentation.process_video()
+    tracker = PersonTracking(input_video, output_dir)
+    tracker.process_video()
+    #segmentation = DanceSegmentation(input_video, output_dir, tracker.lead, tracker.follow)
+    #segmentation.process_video()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process video for person segmentation and room orientation.")
