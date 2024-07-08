@@ -24,8 +24,6 @@ class PersonTracking:
         self.lead = self.load_json(self.lead_file)
         self.follow = self.load_json(self.follow_file)
 
-        self.sam_predictor = None
-
     def process_video(self):
         self.detect_men_women()
         self.detect_poses()
@@ -134,12 +132,13 @@ class PersonTracking:
             follow = None
 
             if len(closest_poses) == 2:
-                if closest_poses[0][4] == 'man' and closest_poses[1][4] == 'woman':
-                    lead, follow = closest_poses[0], closest_poses[1]
-                elif closest_poses[0][4] == 'woman' and closest_poses[1][4] == 'man':
-                    lead, follow = closest_poses[1], closest_poses[0]
+                # Find the pose that most closely matches a man's bounding box
+                man_pose = self.find_best_matching_man_pose(closest_poses, men)
+                if man_pose:
+                    lead = man_pose
+                    follow = [p for p in closest_poses if p != lead][0]
                 else:
-                    # If both are the same gender or unidentified, use size to determine lead/follow
+                    # If no man is found, use height to determine lead/follow
                     if closest_poses[0][5] > closest_poses[1][5]:
                         lead, follow = closest_poses[0], closest_poses[1]
                     else:
@@ -156,6 +155,40 @@ class PersonTracking:
         self.save_json(self.lead, self.lead_file)
         self.save_json(self.follow, self.follow_file)
         print("Saved lead and follow data.")
+
+    def find_best_matching_man_pose(self, poses, men_boxes):
+        best_match = None
+        best_iou = 0
+        for pose in poses:
+            pose_box = self.get_pose_bounding_box(pose[0])
+            for man_box in men_boxes:
+                iou = self.calculate_iou(pose_box, man_box[:4])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match = pose
+        return best_match
+
+    @staticmethod
+    def calculate_iou(box1, box2):
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0
+
+    @staticmethod
+    def get_pose_bounding_box(pose):
+        valid_points = [p[:2] for p in pose if p[2] > 0]
+        if not valid_points:
+            return None
+        x_coords, y_coords = zip(*valid_points)
+        return [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
 
     def get_pose_gender(self, pose, men, women):
         pose_center = self.get_pose_center(pose)
