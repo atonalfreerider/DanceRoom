@@ -116,10 +116,12 @@ class DanceSegmentation:
             pose_data = []
             for pose in poses:
                 avg_depth, size = self.calculate_pose_score(pose, depth_map, frame_width, frame_height)
-                gender = 'man' if self.pose_in_boxes(pose, men) else 'woman' if self.pose_in_boxes(pose,
-                                                                                                   women) else 'neutral'
+                man_conf = max([box[4] for box in men if self.pose_in_box(pose, box)], default=0)
+                woman_conf = max([box[4] for box in women if self.pose_in_box(pose, box)], default=0)
+                gender = 'man' if man_conf > woman_conf else 'woman'
+                gender_conf = max(man_conf, woman_conf)
                 pose_size = self.calculate_pose_size(pose)
-                pose_data.append((pose, avg_depth, size, gender, pose_size))
+                pose_data.append((pose, avg_depth, size, gender, gender_conf, pose_size))
 
             # Sort poses by depth (closest first)
             pose_data.sort(key=lambda x: x[1])
@@ -131,30 +133,22 @@ class DanceSegmentation:
             follow = None
 
             if len(closest_poses) == 2:
-                if closest_poses[0][4] == 'man' and closest_poses[1][4] == 'man':
-                    # Two closest are men, larger is lead, smaller is follow
-                    if closest_poses[0][5] > closest_poses[1][5]:
-                        lead, follow = closest_poses[0], closest_poses[1]
-                    else:
-                        lead, follow = closest_poses[1], closest_poses[0]
-                elif closest_poses[0][4] == 'woman' and closest_poses[1][4] == 'woman':
-                    # Two closest are women, larger is lead, smaller is follow
-                    if closest_poses[0][5] > closest_poses[1][5]:
-                        lead, follow = closest_poses[0], closest_poses[1]
-                    else:
-                        lead, follow = closest_poses[1], closest_poses[0]
+                # Assign gender based on highest confidence
+                if closest_poses[0][4] > closest_poses[1][4]:
+                    lead = closest_poses[0]
+                    follow = closest_poses[1]
+                    follow = (
+                        follow[0], follow[1], follow[2], 'woman' if lead[3] == 'man' else 'man', follow[4], follow[5])
                 else:
-                    # One man and one woman, or other combinations
-                    lead = next((p for p in closest_poses if p[4] == 'man'), None)
-                    follow = next((p for p in closest_poses if p[4] == 'woman'), None)
+                    lead = closest_poses[1]
+                    follow = closest_poses[0]
+                    follow = (
+                        follow[0], follow[1], follow[2], 'woman' if lead[3] == 'man' else 'man', follow[4], follow[5])
 
-                    # If we don't have both lead and follow, assign based on depth
-                    if not lead and not follow:
-                        lead, follow = closest_poses[0], closest_poses[1]
-                    elif not lead:
-                        lead = [p for p in closest_poses if p != follow][0]
-                    elif not follow:
-                        follow = [p for p in closest_poses if p != lead][0]
+                # Ensure lead is always the man
+                if lead[3] == 'woman':
+                    lead, follow = follow, lead
+
             elif len(closest_poses) == 1:
                 lead = closest_poses[0]
 
@@ -211,14 +205,14 @@ class DanceSegmentation:
         return avg_depth, size
 
     @staticmethod
-    def pose_in_boxes(pose, boxes):
+    def pose_in_box(pose, box):
         valid_points = [p for p in pose if p[2] > 0]  # Consider only points with confidence > 0
         if not valid_points:
             return False
         x_coords, y_coords, _ = zip(*valid_points)
         pose_center_x = sum(x_coords) / len(x_coords)
         pose_center_y = sum(y_coords) / len(y_coords)
-        return any(box[0] <= pose_center_x <= box[2] and box[1] <= pose_center_y <= box[3] for box in boxes)
+        return box[0] <= pose_center_x <= box[2] and box[1] <= pose_center_y <= box[3]
 
     @staticmethod
     def get_3d_keypoints(pose, depth_map, frame_width, frame_height):
