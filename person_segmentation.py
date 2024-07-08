@@ -1,10 +1,8 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from segment_anything import SamPredictor, sam_model_registry
 import json
 import os
-import glob
 import matplotlib.pyplot as plt
 
 
@@ -12,9 +10,7 @@ class DanceSegmentation:
     def __init__(self, input_path, output_dir):
         self.input_path = input_path
         self.output_dir = output_dir
-        self.mask_dir = os.path.join(output_dir, 'masks')
         self.depth_dir = os.path.join(output_dir, 'depth')
-        os.makedirs(self.mask_dir, exist_ok=True)
 
         self.men_women_file = os.path.join(output_dir, 'men-women.json')
         self.detections_file = os.path.join(output_dir, 'detections.json')
@@ -26,13 +22,10 @@ class DanceSegmentation:
         self.lead = self.load_json(self.lead_file)
         self.follow = self.load_json(self.follow_file)
 
-        self.sam_predictor = None
-
     def process_video(self):
         self.detect_men_women()
         self.detect_poses()
         self.match_poses_and_identify_leads()
-        # self.segment_leads()
         self.generate_debug_video()
         print("Video processing complete.")
 
@@ -122,14 +115,14 @@ class DanceSegmentation:
             # Calculate scores, depths, sizes, and genders for all poses
             pose_data = []
             for pose in poses:
-                score, avg_depth, size = self.calculate_pose_score(pose, depth_map, frame_width, frame_height)
+                avg_depth, size = self.calculate_pose_score(pose, depth_map, frame_width, frame_height)
                 gender = 'man' if self.pose_in_boxes(pose, men) else 'woman' if self.pose_in_boxes(pose,
                                                                                                    women) else 'neutral'
                 pose_size = self.calculate_pose_size(pose)
-                pose_data.append((pose, score, avg_depth, size, gender, pose_size))
+                pose_data.append((pose, avg_depth, size, gender, pose_size))
 
             # Sort poses by depth (closest first)
-            pose_data.sort(key=lambda x: x[2])
+            pose_data.sort(key=lambda x: x[1])
 
             # Get the two closest poses
             closest_poses = pose_data[:2] if len(pose_data) >= 2 else pose_data
@@ -193,23 +186,20 @@ class DanceSegmentation:
     @staticmethod
     def calculate_pose_score(pose, depth_map, frame_width, frame_height):
         pose_depths = []
-        pose_confidences = []
         valid_keypoints = []
         for kp in pose:
             x, y, conf = kp[0], kp[1], kp[2]
-            if conf > 0:
+            if conf > 0 and x > 0 and y > 0:
                 x_scaled = int(x * 640 / frame_width)
                 y_scaled = int(y * 480 / frame_height)
                 if 0 <= x_scaled < 640 and 0 <= y_scaled < 480:
                     pose_depths.append(depth_map[y_scaled, x_scaled])
-                    pose_confidences.append(conf)
                     valid_keypoints.append((x, y))
 
         if not pose_depths:
-            return 0, float('inf'), 0
+            return float('inf'), 0
 
         avg_depth = np.mean(pose_depths)
-        avg_confidence = np.mean(pose_confidences)
 
         # Calculate pose size (bounding box area)
         if valid_keypoints:
@@ -218,9 +208,7 @@ class DanceSegmentation:
         else:
             size = 0
 
-        # Calculate a score that favors closer poses with higher confidence
-        score = avg_confidence / (avg_depth + 1e-6)  # Add small epsilon to avoid division by zero
-        return score, avg_depth, size
+        return avg_depth, size
 
     @staticmethod
     def pose_in_boxes(pose, boxes):
@@ -248,57 +236,6 @@ class DanceSegmentation:
             else:
                 keypoints_3d.append([float(x), float(y), 0, float(conf)])  # Convert all to float
         return keypoints_3d
-
-    def segment_leads(self):
-        if not self.sam_predictor:
-            sam = sam_model_registry["default"](checkpoint="sam_vit_h_4b8939.pth")
-            self.sam_predictor = SamPredictor(sam)
-
-        cap = cv2.VideoCapture(self.input_path)
-
-        existing_masks = glob.glob(os.path.join(self.mask_dir, 'mask_lead_??????.png'))
-        start_frame = len(existing_masks)
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frame_count = start_frame
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            lead_pose = self.lead.get(str(frame_count))
-            follow_pose = self.follow.get(str(frame_count))
-
-            if lead_pose:
-                self.segment_person(frame, lead_pose, frame_count, 'lead')
-            if follow_pose:
-                self.segment_person(frame, follow_pose, frame_count, 'follow')
-
-            frame_count += 1
-            if frame_count % 100 == 0:
-                print(f"Processed {frame_count} frames for segmentation")
-
-        cap.release()
-
-    def segment_person(self, frame, pose, frame_num, person_type):
-        self.sam_predictor.set_image(frame)
-
-        # Get bounding box from pose
-        x_coords = [kp[0] for kp in pose if kp[3] > 0.5]  # Only consider high confidence keypoints
-        y_coords = [kp[1] for kp in pose if kp[3] > 0.5]
-        if not x_coords or not y_coords:
-            return
-
-        x1, y1 = min(x_coords), min(y_coords)
-        x2, y2 = max(x_coords), max(y_coords)
-
-        box = np.array([x1, y1, x2, y2])
-        masks, _, _ = self.sam_predictor.predict(box=box, multimask_output=False)
-        mask = masks[0].astype(np.uint8)
-
-        mask_file = os.path.join(self.mask_dir, f'mask_{person_type}_{frame_num:06d}.png')
-        cv2.imwrite(mask_file, mask * 255)
 
     #region UTILITY
 
