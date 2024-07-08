@@ -120,8 +120,7 @@ class PersonTracking:
             pose_data = []
             for pose in poses:
                 score, avg_depth, size = self.calculate_pose_score(pose, depth_map, frame_width, frame_height)
-                gender = 'man' if self.pose_in_boxes(pose, men) else 'woman' if self.pose_in_boxes(pose,
-                                                                                                   women) else 'neutral'
+                gender = self.get_pose_gender(pose, men, women)
                 pose_size = self.calculate_pose_size(pose)
                 pose_data.append((pose, score, avg_depth, size, gender, pose_size))
 
@@ -135,30 +134,16 @@ class PersonTracking:
             follow = None
 
             if len(closest_poses) == 2:
-                if closest_poses[0][4] == 'man' and closest_poses[1][4] == 'man':
-                    # Two closest are men, larger is lead, smaller is follow
-                    if closest_poses[0][5] > closest_poses[1][5]:
-                        lead, follow = closest_poses[0], closest_poses[1]
-                    else:
-                        lead, follow = closest_poses[1], closest_poses[0]
-                elif closest_poses[0][4] == 'woman' and closest_poses[1][4] == 'woman':
-                    # Two closest are women, larger is lead, smaller is follow
-                    if closest_poses[0][5] > closest_poses[1][5]:
-                        lead, follow = closest_poses[0], closest_poses[1]
-                    else:
-                        lead, follow = closest_poses[1], closest_poses[0]
+                if closest_poses[0][4] == 'man' and closest_poses[1][4] == 'woman':
+                    lead, follow = closest_poses[0], closest_poses[1]
+                elif closest_poses[0][4] == 'woman' and closest_poses[1][4] == 'man':
+                    lead, follow = closest_poses[1], closest_poses[0]
                 else:
-                    # One man and one woman, or other combinations
-                    lead = next((p for p in closest_poses if p[4] == 'man'), None)
-                    follow = next((p for p in closest_poses if p[4] == 'woman'), None)
-
-                    # If we don't have both lead and follow, assign based on depth
-                    if not lead and not follow:
+                    # If both are the same gender or unidentified, use size to determine lead/follow
+                    if closest_poses[0][5] > closest_poses[1][5]:
                         lead, follow = closest_poses[0], closest_poses[1]
-                    elif not lead:
-                        lead = [p for p in closest_poses if p != follow][0]
-                    elif not follow:
-                        follow = [p for p in closest_poses if p != lead][0]
+                    else:
+                        lead, follow = closest_poses[1], closest_poses[0]
             elif len(closest_poses) == 1:
                 lead = closest_poses[0]
 
@@ -171,6 +156,32 @@ class PersonTracking:
         self.save_json(self.lead, self.lead_file)
         self.save_json(self.follow, self.follow_file)
         print("Saved lead and follow data.")
+
+    def get_pose_gender(self, pose, men, women):
+        pose_center = self.get_pose_center(pose)
+        for box in men:
+            if self.point_in_box(pose_center, box):
+                return 'man'
+        for box in women:
+            if self.point_in_box(pose_center, box):
+                return 'woman'
+        return 'neutral'
+
+    @staticmethod
+    def get_pose_center(pose):
+        valid_points = [p[:2] for p in pose if p[2] > 0]
+        if not valid_points:
+            return None
+        x_coords, y_coords = zip(*valid_points)
+        return sum(x_coords) / len(x_coords), sum(y_coords) / len(y_coords)
+
+    @staticmethod
+    def point_in_box(point, box):
+        if point is None:
+            return False
+        x, y = point
+        x1, y1, x2, y2, _ = box
+        return x1 <= x <= x2 and y1 <= y <= y2
 
     @staticmethod
     def calculate_pose_size(pose):
@@ -218,16 +229,6 @@ class PersonTracking:
         # Calculate a score that favors closer poses with higher confidence
         score = avg_confidence / (avg_depth + 1e-6)  # Add small epsilon to avoid division by zero
         return score, avg_depth, size
-
-    @staticmethod
-    def pose_in_boxes(pose, boxes):
-        valid_points = [p for p in pose if p[2] > 0]  # Consider only points with confidence > 0
-        if not valid_points:
-            return False
-        x_coords, y_coords, _ = zip(*valid_points)
-        pose_center_x = sum(x_coords) / len(x_coords)
-        pose_center_y = sum(y_coords) / len(y_coords)
-        return any(box[0] <= pose_center_x <= box[2] and box[1] <= pose_center_y <= box[3] for box in boxes)
 
     @staticmethod
     def get_3d_keypoints(pose, depth_map, frame_width, frame_height):
