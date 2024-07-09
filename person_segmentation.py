@@ -5,6 +5,7 @@ import json
 import os
 import matplotlib.pyplot as plt
 from yolox.tracker.byte_tracker import BYTETracker
+import torch
 
 
 class BYTETrackerArgs:
@@ -14,9 +15,6 @@ class BYTETrackerArgs:
     aspect_ratio_thresh: float = 3.0
     min_box_area: float = 1.0
     mot20: bool = False
-
-
-tracker = BYTETracker(BYTETrackerArgs())
 
 
 class DanceSegmentation:
@@ -36,7 +34,6 @@ class DanceSegmentation:
         self.follow = self.load_json(self.follow_file)
 
     def process_video(self):
-        id = tracker.frame_id
         self.detect_men_women()
         self.detect_poses()
         self.match_poses_and_identify_leads()
@@ -108,14 +105,13 @@ class DanceSegmentation:
         print(f"Saved pose detections for {frame_count} frames.")
 
     def match_poses_and_identify_leads(self):
-        if self.lead and self.follow:
-            print("Using cached lead and follow data.")
-            return
-
         cap = cv2.VideoCapture(self.input_path)
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
+
+        tracker = BYTETracker(BYTETrackerArgs())
+        tracked_sequences = {}
 
         for frame_num in self.men_women.keys():
             depth_map = self.load_depth_map(int(frame_num))
@@ -143,38 +139,59 @@ class DanceSegmentation:
             # Get the two closest poses
             closest_poses = pose_data[:2] if len(pose_data) >= 2 else pose_data
 
-            lead = None
-            follow = None
+            # Prepare detections for ByteTracker
+            dets = []
+            for p in closest_poses:
+                bbox = self.pose_to_bbox(p[0])
+                confidence = p[4]  # This is the gender confidence
+                class_score = 1.0  # Assuming all detections are of the same class (person)
+                dets.append(bbox + [confidence, class_score])
 
-            if len(closest_poses) == 2:
-                # Assign gender based on highest confidence
-                if closest_poses[0][4] > closest_poses[1][4]:
-                    lead = closest_poses[0]
-                    follow = closest_poses[1]
-                    follow = (
-                        follow[0], follow[1], follow[2], 'woman' if lead[3] == 'man' else 'man', follow[4], follow[5])
-                else:
-                    lead = closest_poses[1]
-                    follow = closest_poses[0]
-                    follow = (
-                        follow[0], follow[1], follow[2], 'woman' if lead[3] == 'man' else 'man', follow[4], follow[5])
+            dets = torch.tensor(dets, dtype=torch.float32)
 
-                # Ensure lead is always the man
-                if lead[3] == 'woman':
-                    lead, follow = follow, lead
+            if len(dets) > 0:
+                img_info = [frame_height, frame_width]  # Changed to list
+                img_size = [frame_height, frame_width]
+                online_targets = tracker.update(dets, img_info, img_size)
 
-            elif len(closest_poses) == 1:
-                lead = closest_poses[0]
+                # Update tracked sequences
+                for t in online_targets:
+                    track_id = t.track_id
+                    if track_id not in tracked_sequences:
+                        tracked_sequences[track_id] = []
 
-            # Convert to 3D keypoints
-            if lead:
-                self.lead[frame_num] = self.get_3d_keypoints(lead[0], depth_map, frame_width, frame_height)
-            if follow:
-                self.follow[frame_num] = self.get_3d_keypoints(follow[0], depth_map, frame_width, frame_height)
+                    # Find the closest pose to the tracked object
+                    tlwh = t.tlwh
+                    center_x, center_y = tlwh[0] + tlwh[2] / 2, tlwh[1] + tlwh[3] / 2
+                    closest_pose = min(closest_poses, key=lambda p: self.distance_to_center(p[0], center_x, center_y))
 
-        self.save_json(self.lead, self.lead_file)
-        self.save_json(self.follow, self.follow_file)
-        print("Saved lead and follow data.")
+                    tracked_sequences[track_id].append((frame_num, closest_pose))
+            else:
+                print(f"No detections for frame {frame_num}")
+
+        # Assign genders to tracked sequences
+        for track_id, sequence in tracked_sequences.items():
+            gender_votes = {'man': 0, 'woman': 0}
+            for _, pose_data in sequence:
+                gender_votes[pose_data[3]] += pose_data[4]  # Add gender confidence
+            final_gender = max(gender_votes, key=gender_votes.get)
+
+    def pose_to_bbox(self, pose):
+        valid_points = [p[:2] for p in pose if p[2] > 0]
+        if not valid_points:
+            return [0, 0, 1, 1]  # Return a small box if no valid points
+        x_coords, y_coords = zip(*valid_points)
+        left, top = min(x_coords), min(y_coords)
+        right, bottom = max(x_coords), max(y_coords)
+        return [left, top, right, bottom]
+
+    def distance_to_center(self, pose, center_x, center_y):
+        valid_points = [p[:2] for p in pose if p[2] > 0]
+        if not valid_points:
+            return float('inf')
+        pose_center_x = sum(p[0] for p in valid_points) / len(valid_points)
+        pose_center_y = sum(p[1] for p in valid_points) / len(valid_points)
+        return ((pose_center_x - center_x) ** 2 + (pose_center_y - center_y) ** 2) ** 0.5
 
     @staticmethod
     def calculate_pose_size(pose):
