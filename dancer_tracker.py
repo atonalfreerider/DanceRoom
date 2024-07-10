@@ -17,7 +17,7 @@ class BYTETrackerArgs:
     mot20: bool = False
 
 
-class DanceSegmentation:
+class DancerTracker:
     def __init__(self, input_path, output_dir):
         self.input_path = input_path
         self.output_dir = output_dir

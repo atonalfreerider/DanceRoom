@@ -1,19 +1,23 @@
 import os
 import argparse
 
+from segmenter import Segmenter
 import room_tracker
-from person_segmentation import DanceSegmentation
+from dancer_tracker import DancerTracker
 
 
 def main(input_video, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
-    deltas = room_tracker.room_tracker(input_video, output_dir + "/deltas.json", output_dir + "/debug-points.mp4")
+    #segmenter = Segmenter(input_video, output_dir)
+    #segmenter.process_video()
+
+    #deltas = room_tracker.room_tracker(input_video, output_dir + "/deltas.json", output_dir + "/debug-points.mp4")
     #room_tracker.debug_render(input_video, deltas, output_dir + "/delta-video.mp4")
 
     # Step 1: Segment people, create background-only video, and save masks and poses
-    #segmentation = DanceSegmentation(input_video, output_dir)
-    #segmentation.process_video()
+    #dancer_tracker = DancerTracker(input_video, output_dir)
+    #dancer_tracker.process_video()
 
 
 if __name__ == "__main__":
