@@ -103,7 +103,7 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
             # Filter out points inside COCO detection boxes
             good_indices = [i for i, point in enumerate(good_new)
-                            if not any(point_in_box(point[0], box) for box in current_boxes)]
+                            if not any(point_in_box(point, box) for box in current_boxes)]
             good_new = good_new[good_indices]
             good_old = good_old[good_indices]
 

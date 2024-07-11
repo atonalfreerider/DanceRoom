@@ -35,7 +35,6 @@ class DancerTracker:
 
     def process_video(self):
         self.detect_men_women()
-        self.detect_poses()
         self.match_poses_and_identify_leads()
         self.generate_debug_video()
         print("Video processing complete.")
@@ -76,34 +75,6 @@ class DancerTracker:
         self.save_json(self.men_women, self.men_women_file)
         print(f"Saved men-women detections for {frame_count} frames.")
 
-    def detect_poses(self):
-        if self.detections:
-            print("Using cached pose detections.")
-            return
-
-        model = YOLO('yolov8x-pose-p6.pt')
-        cap = cv2.VideoCapture(self.input_path)
-        frame_count = 0
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            results = model(frame)
-            poses = []
-
-            for r in results:
-                for pose in r.keypoints.data:
-                    poses.append(pose.tolist())
-
-            self.detections[frame_count] = poses
-            frame_count += 1
-
-        cap.release()
-        self.save_json(self.detections, self.detections_file)
-        print(f"Saved pose detections for {frame_count} frames.")
-
     def match_poses_and_identify_leads(self):
         cap = cv2.VideoCapture(self.input_path)
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -125,13 +96,14 @@ class DancerTracker:
             # Calculate scores, depths, sizes, and genders for all poses
             pose_data = []
             for pose in poses:
-                avg_depth, size = self.calculate_pose_score(pose, depth_map, frame_width, frame_height)
-                man_conf = max([box[4] for box in men if self.pose_in_box(pose, box)], default=0)
-                woman_conf = max([box[4] for box in women if self.pose_in_box(pose, box)], default=0)
+                keypoints = pose["keypoints"]
+                avg_depth, size = self.calculate_pose_score(keypoints, depth_map, frame_width, frame_height)
+                man_conf = max([box[4] for box in men if self.pose_in_box(keypoints, box)], default=0)
+                woman_conf = max([box[4] for box in women if self.pose_in_box(keypoints, box)], default=0)
                 gender = 'man' if man_conf > woman_conf else 'woman'
                 gender_conf = max(man_conf, woman_conf)
-                pose_size = self.calculate_pose_size(pose)
-                pose_data.append((pose, avg_depth, size, gender, gender_conf, pose_size))
+                pose_size = self.calculate_pose_size(keypoints)
+                pose_data.append((keypoints, avg_depth, size, gender, gender_conf, pose_size))
 
             # Sort poses by depth (closest first)
             pose_data.sort(key=lambda x: x[1])
@@ -324,7 +296,7 @@ class DancerTracker:
 
             poses = self.detections.get(str(frame_count), [])
             for pose in poses:
-                self.draw_pose(debug_frame, pose, (128, 128, 128))  # Gray for all poses
+                self.draw_pose(debug_frame, pose["keypoints"], (128, 128, 128))  # Gray for all poses
 
             lead_pose = self.lead.get(str(frame_count))
             if lead_pose:

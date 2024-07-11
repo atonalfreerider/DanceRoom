@@ -18,7 +18,7 @@ class YOLOPose:
 
     def save_json(self, data, json_path):
         with open(json_path, 'w') as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2)
 
     def detect_poses(self):
         if self.detections:
