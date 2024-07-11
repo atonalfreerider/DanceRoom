@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import json
 from tqdm import tqdm
+from scipy.spatial import distance
 
 
 def load_yolo_detections(json_path):
@@ -25,6 +26,26 @@ def filter_static_points(points, old_points, threshold=0.1):
     return points[distances > threshold]
 
 
+def estimate_transform(src_points, dst_points):
+    # Use RANSAC to estimate the transformation
+    transform_matrix, inliers = cv2.estimateAffinePartial2D(src_points, dst_points, method=cv2.RANSAC,
+                                                            ransacReprojThreshold=3.0)
+
+    if transform_matrix is not None:
+        # Extract translation
+        dx, dy = transform_matrix[:2, 2]
+
+        # Extract rotation
+        rotation = np.arctan2(transform_matrix[1, 0], transform_matrix[0, 0])
+
+        # Extract scale (zoom)
+        scale = np.sqrt(transform_matrix[0, 0] ** 2 + transform_matrix[1, 0] ** 2)
+
+        return dx, dy, rotation, scale, inliers
+    else:
+        return 0, 0, 0, 1, None
+
+
 def room_tracker(input_path, output_path, debug_output_path, yolo_detections_path):
     # Load YOLO detections
     yolo_detections = load_yolo_detections(yolo_detections_path)
@@ -42,18 +63,6 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     debug_out = cv2.VideoWriter(debug_output_path, fourcc, fps, (width, height))
 
-    # Camera matrix (you may need to calibrate your camera to get accurate values)
-    focal_length = 1000
-    center = (width // 2, height // 2)
-    camera_matrix = np.array([
-        [focal_length, 0, center[0]],
-        [0, focal_length, center[1]],
-        [0, 0, 1]
-    ], dtype=np.float32)
-
-    # Distortion coefficients (assume no distortion)
-    dist_coeffs = np.zeros((4, 1))
-
     # Initialize feature detector and tracker
     feature_params = dict(qualityLevel=0.01, minDistance=7, blockSize=7)
     lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
@@ -68,31 +77,20 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
     # Initialize variables for storing deltas and tracks
     deltas = []
-    prev_angles = None
-
     tracks = {}
     next_track_id = 0
     max_track_length = int(5 * fps)  # 5 seconds of tracks
-
-    frame_count = 0
-    pbar = tqdm(total=total_frames, desc="Processing frames")
 
     # Initialize crosshair position
     crosshair_x = width // 2
     crosshair_y = height // 2
     initial_crosshair_size = 20
     crosshair_size = initial_crosshair_size
-    zoom_factor = 1
 
-    # Initialize cumulative transformation
-    cumulative_pan = 0.0
-    cumulative_tilt = 0.0
-    cumulative_roll = 0.0
+    frame_count = 0
+    pbar = tqdm(total=total_frames, desc="Processing frames")
 
-    # Initialize previous rotation and translation
-    prev_rotation_vector = None
-    prev_translation_vector = None
-    prev_good_points = None
+    prev_points = None
 
     while True:
         ret, frame = cap.read()
@@ -104,6 +102,30 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
         # Get YOLO detections for the current frame
         current_detections = yolo_detections.get(str(frame_count), [])
         current_boxes = [detection["bbox"] for detection in current_detections]
+
+        good_new = []
+        good_old = []
+
+        # Calculate optical flow for existing tracks
+        if tracks:
+            prev_points = np.float32([track['points'][-1][1] for track in tracks.values()]).reshape(-1, 1, 2)
+            curr_points, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, prev_points, None, **lk_params)
+
+            # Update tracks
+            updated_tracks = {}
+
+            for (track_id, track), (new, status) in zip(list(tracks.items()), zip(curr_points, st.ravel())):
+                if status:
+                    if not any(point_in_box(new[0], box) for box in current_boxes):
+                        track['points'].append((frame_count, tuple(new.ravel())))
+                        track['last_seen'] = frame_count
+                        while track['points'] and frame_count - track['points'][0][0] >= max_track_length:
+                            track['points'].pop(0)
+                        updated_tracks[track_id] = track
+                        good_new.append(new.reshape(2))
+                        good_old.append(prev_points[list(tracks.keys()).index(track_id)].reshape(2))
+
+            tracks = updated_tracks
 
         # Detect new points if needed
         if len(tracks) < 20:
@@ -129,115 +151,53 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
                     }
                     next_track_id += 1
 
-        # Calculate optical flow for existing tracks
-        if tracks:
-            prev_points = np.float32([track['points'][-1][1] for track in tracks.values()]).reshape(-1, 1, 2)
-            curr_points, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, prev_points, None, **lk_params)
+        good_new = np.array(good_new)
+        good_old = np.array(good_old)
 
-            # Update tracks
-            for (track_id, track), (new, status) in zip(list(tracks.items()), zip(curr_points, st)):
-                if status:
-                    if not any(point_in_box(new[0], box) for box in current_boxes):
-                        track['points'].append((frame_count, tuple(new.ravel())))
-                        track['last_seen'] = frame_count
-                        # Remove old points
-                        while track['points'] and frame_count - track['points'][0][0] >= max_track_length:
-                            track['points'].pop(0)
-                    else:
-                        del tracks[track_id]
-                else:
-                    del tracks[track_id]
+        # Estimate transform and calculate deltas
+        if len(good_new) >= 4 and len(good_old) >= 4:
+            dx, dy, rotation, scale, inliers = estimate_transform(good_old, good_new)
 
-        # Remove tracks that haven't been updated recently
-        tracks = {k: v for k, v in tracks.items() if frame_count - v['last_seen'] < 30}
+            if inliers is not None:
+                # Use only inlier points
+                good_new = good_new[inliers.ravel() == 1]
+                good_old = good_old[inliers.ravel() == 1]
 
-        # Prepare points for PnP
-        good_points = np.array([track['points'][-1][1] for track in tracks.values()])
+                # Calculate zoom
+                zoom_factor = scale
+                delta_zoom = zoom_factor - 1
 
-        # Estimate camera pose and zoom
-        if len(good_points) >= 4:
-            obj_points = np.hstack((good_points, np.zeros((len(good_points), 1)))).astype(np.float32)
+                deltas.append({
+                    "frame": frame_count,
+                    "delta_x": float(dx),
+                    "delta_y": float(dy),
+                    "delta_roll": float(rotation),
+                    "delta_zoom": float(delta_zoom)
+                })
 
-            success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(
-                obj_points, good_points, camera_matrix, dist_coeffs
-            )
+                # Update crosshair position and size
+                crosshair_x -= int(dx)
+                crosshair_y -= int(dy)
+                crosshair_size *= zoom_factor
 
-            if success:
-                # Convert rotation vector to rotation matrix
-                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                # Rotate crosshair
+                rot_matrix = cv2.getRotationMatrix2D((crosshair_x, crosshair_y), np.degrees(rotation), 1)
+                crosshair_points = np.array([
+                    [crosshair_x - crosshair_size, crosshair_y],
+                    [crosshair_x + crosshair_size, crosshair_y],
+                    [crosshair_x, crosshair_y - crosshair_size],
+                    [crosshair_x, crosshair_y + crosshair_size]
+                ])
+                rotated_crosshair = cv2.transform(np.array([crosshair_points]), rot_matrix)[0]
 
-                # Calculate Euler angles
-                euler_angles = \
-                cv2.decomposeProjectionMatrix(np.hstack((rotation_matrix, translation_vector.reshape(3, 1))))[6]
-                pan, tilt, roll = [angle[0] for angle in euler_angles]
+                # Reset crosshair if it moves out of frame
+                if (crosshair_x < 0 or crosshair_x >= width or
+                        crosshair_y < 0 or crosshair_y >= height):
+                    crosshair_x = width // 2
+                    crosshair_y = height // 2
+                    crosshair_size = initial_crosshair_size
 
-                # Calculate zoom factor
-                if prev_good_points is not None and len(prev_good_points) > 0:
-                    prev_center = np.mean(prev_good_points, axis=0)
-                    curr_center = np.mean(good_points, axis=0)
-                    prev_distances = np.linalg.norm(prev_good_points - prev_center, axis=1)
-                    curr_distances = np.linalg.norm(good_points - curr_center, axis=1)
-                    zoom_factor = np.mean(curr_distances) / np.mean(prev_distances)
-                else:
-                    zoom_factor = 1.0
-
-                # Calculate deltas
-                if prev_rotation_vector is not None and prev_translation_vector is not None:
-                    delta_rotation = rotation_vector - prev_rotation_vector
-                    delta_translation = translation_vector - prev_translation_vector
-
-                    delta_pan = float(delta_rotation[1])  # Rotation around y-axis
-                    delta_tilt = float(delta_rotation[0])  # Rotation around x-axis
-                    delta_roll = float(delta_rotation[2])  # Rotation around z-axis
-                    delta_zoom = float(zoom_factor - 1.0)  # Change in zoom factor
-
-                    deltas.append({
-                        "frame": frame_count,
-                        "delta_pan": delta_pan,
-                        "delta_tilt": delta_tilt,
-                        "delta_roll": delta_roll,
-                        "delta_zoom": delta_zoom
-                    })
-
-                    # Update crosshair position to stay fixed in world space
-                    crosshair_x += int(delta_pan * focal_length)
-                    crosshair_y -= int(delta_tilt * focal_length)
-
-                    # Update crosshair size based on zoom
-                    crosshair_size *= zoom_factor
-
-                    # Reset crosshair if it moves out of frame
-                    if (crosshair_x < 0 or crosshair_x >= width or
-                            crosshair_y < 0 or crosshair_y >= height):
-                        crosshair_x = width // 2
-                        crosshair_y = height // 2
-                        crosshair_size = initial_crosshair_size * zoom_factor
-                        cumulative_pan = 0.0
-                        cumulative_tilt = 0.0
-                        cumulative_roll = 0.0
-                    else:
-                        cumulative_pan += delta_pan
-                        cumulative_tilt += delta_tilt
-                        cumulative_roll += delta_roll
-
-                # Update previous values
-                prev_rotation_vector = rotation_vector
-                prev_translation_vector = translation_vector
-
-        # Calculate crosshair points
-        half_size = int(crosshair_size // 2)
-        crosshair_points = np.array([
-            [crosshair_x - half_size, crosshair_y],
-            [crosshair_x + half_size, crosshair_y],
-            [crosshair_x, crosshair_y - half_size],
-            [crosshair_x, crosshair_y + half_size]
-        ])
-
-        # Rotate crosshair
-        rot_matrix = cv2.getRotationMatrix2D((crosshair_x, crosshair_y), np.degrees(float(cumulative_roll)), 1)
-        rotated_crosshair = cv2.transform(np.array([crosshair_points]), rot_matrix)[0]
-
-        # Draw tracks
+        # Draw tracks and crosshair
         mask = np.zeros_like(frame)
         for track_id, track in tracks.items():
             points = track['points']
@@ -246,30 +206,20 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
                     pt1 = tuple(map(int, points[i - 1][1]))
                     pt2 = tuple(map(int, points[i][1]))
                     cv2.line(mask, pt1, pt2, (0, 255, 0), 2)
-
-                # Draw the current point
                 cv2.circle(frame, tuple(map(int, points[-1][1])), 5, (0, 0, 255), -1)
-                # Draw track ID
                 cv2.putText(frame, str(track_id), tuple(map(int, points[-1][1])),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         img = cv2.add(frame, mask)
 
-        # Draw YOLO detection boxes
-        for box in current_boxes:
-            x1, y1, x2, y2 = map(int, box)
-            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-
         # Draw crosshair
-        cv2.line(img, tuple(map(int, rotated_crosshair[0])), tuple(map(int, rotated_crosshair[1])), (0, 255, 0), 2)
-        cv2.line(img, tuple(map(int, rotated_crosshair[2])), tuple(map(int, rotated_crosshair[3])), (0, 255, 0), 2)
+        half_size = int(crosshair_size // 2)
+        cv2.line(img, (crosshair_x - half_size, crosshair_y), (crosshair_x + half_size, crosshair_y), (0, 255, 0), 2)
+        cv2.line(img, (crosshair_x, crosshair_y - half_size), (crosshair_x, crosshair_y + half_size), (0, 255, 0), 2)
 
         debug_out.write(img)
 
-        # Update the previous frame and points
         old_gray = frame_gray.copy()
-        prev_good_points = good_points.copy() if len(good_points) > 0 else prev_good_points
-        p0 = np.float32([track['points'][-1][1] for track in tracks.values() if track['points']]).reshape(-1, 1, 2)
 
         frame_count += 1
         pbar.update(1)
