@@ -25,7 +25,6 @@ def filter_static_points(points, old_points, threshold=0.1):
     return points[distances > threshold]
 
 
-
 def room_tracker(input_path, output_path, debug_output_path, yolo_detections_path):
     # Load YOLO detections
     yolo_detections = load_yolo_detections(yolo_detections_path)
@@ -67,18 +66,21 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     logo_mask = np.ones(old_gray.shape[:2], dtype=np.uint8)
     logo_mask[0:50, 0:50] = 0  # Assume logo is in top-left corner, adjust as needed
 
-    p0 = cv2.goodFeaturesToTrack(old_gray, maxCorners=500, mask=logo_mask, **feature_params)
-
     # Initialize variables for storing deltas and tracks
     deltas = []
     prev_angles = None
-    tracks = []
+
+    tracks = {}
+    next_track_id = 0
     max_track_length = int(5 * fps)  # 5 seconds of tracks
 
     frame_count = 0
-
-    # Progress bar
     pbar = tqdm(total=total_frames, desc="Processing frames")
+
+    # Initialize crosshair position
+    crosshair_x = width // 2
+    crosshair_y = height // 2
+    crosshair_size = 20
 
     while True:
         ret, frame = cap.read()
@@ -91,63 +93,61 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
         current_detections = yolo_detections.get(str(frame_count), [])
         current_boxes = [detection["bbox"] for detection in current_detections]
 
-        # Calculate optical flow
-        p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
+        # Detect new points if needed
+        if len(tracks) < 20:
+            mask = np.ones(frame_gray.shape[:2], dtype=np.uint8)
 
-        # Select good points
-        if p1 is not None:
-            good_new = p1[st == 1]
-            good_old = p0[st == 1]
+            # Mask out existing tracks
+            for track in tracks.values():
+                x, y = map(int, track['points'][-1][1])
+                cv2.circle(mask, (x, y), 10, 0, -1)
 
-            # Filter out points inside YOLO detection boxes
-            good_indices = [i for i, point in enumerate(good_new)
-                            if not any(point_in_box(point, box) for box in current_boxes)]
-            good_new = good_new[good_indices]
-            good_old = good_old[good_indices]
+            # Mask out YOLO detection boxes
+            for box in current_boxes:
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
 
-            # Filter out static points
-            good_new = filter_static_points(good_new, good_old)
-        else:
-            good_new = np.empty((0, 2))
+            new_points = cv2.goodFeaturesToTrack(frame_gray, mask=mask,
+                                                 maxCorners=20 - len(tracks), **feature_params)
+            if new_points is not None:
+                for point in new_points:
+                    tracks[next_track_id] = {
+                        'points': [(frame_count, tuple(point.ravel()))],
+                        'last_seen': frame_count
+                    }
+                    next_track_id += 1
 
-        # If we don't have enough points, detect new ones
-        while len(good_new) < 100:
-            additional_points = cv2.goodFeaturesToTrack(frame_gray, mask=logo_mask,
-                                                        maxCorners=500 - len(good_new), **feature_params)
-            if additional_points is None:
-                break
-            additional_points = additional_points.reshape(-1, 2)
+        # Calculate optical flow for existing tracks
+        if tracks:
+            prev_points = np.float32([track['points'][-1][1] for track in tracks.values()]).reshape(-1, 1, 2)
+            curr_points, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, prev_points, None, **lk_params)
 
-            # Filter out points inside YOLO detection boxes
-            additional_points = [point for point in additional_points
-                                 if not any(point_in_box(point, box) for box in current_boxes)]
+            # Update tracks
+            for (track_id, track), (new, status) in zip(list(tracks.items()), zip(curr_points, st)):
+                if status:
+                    if not any(point_in_box(new[0], box) for box in current_boxes):
+                        track['points'].append((frame_count, tuple(new.ravel())))
+                        track['last_seen'] = frame_count
+                        # Remove old points
+                        while track['points'] and frame_count - track['points'][0][0] >= max_track_length:
+                            track['points'].pop(0)
+                    else:
+                        del tracks[track_id]
+                else:
+                    del tracks[track_id]
 
-            good_new = np.vstack((good_new, additional_points))
+        # Remove tracks that haven't been updated recently
+        tracks = {k: v for k, v in tracks.items() if frame_count - v['last_seen'] < 30}
 
-        # Ensure we have at least 20 points
-        if len(good_new) > 20:
-            good_new = good_new[:20]
-
-        # Update tracks
-        if len(tracks) < len(good_new):
-            for _ in range(len(good_new) - len(tracks)):
-                tracks.append([])
-
-        for i, new in enumerate(good_new):
-            if i < len(tracks):
-                tracks[i].append((frame_count, tuple(new.ravel())))
-                # Remove old points
-                while tracks[i] and frame_count - tracks[i][0][0] >= max_track_length:
-                    tracks[i].pop(0)
+        # Prepare points for PnP
+        good_points = np.array([track['points'][-1][1] for track in tracks.values()])
 
         # Estimate camera pose
-        if len(good_new) >= 4:
-            # Create 3D points assuming all points are on z=0 plane
-            obj_points = np.hstack((good_new, np.zeros((good_new.shape[0], 1)))).astype(np.float32)
+        if len(good_points) >= 4:
+            obj_points = np.hstack((good_points, np.zeros((len(good_points), 1)))).astype(np.float32)
 
-            # Use PnP to estimate camera pose
             success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(
-                obj_points, good_new, camera_matrix, dist_coeffs
+                obj_points, good_points, camera_matrix, dist_coeffs
             )
 
             if success:
@@ -169,21 +169,33 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
                         "delta_roll": float(delta_roll)
                     })
 
+                    # Update crosshair position
+                    crosshair_x -= int(delta_pan * 10)  # Adjust multiplier for sensitivity
+                    crosshair_y += int(delta_tilt * 10)  # Adjust multiplier for sensitivity
+
+                    # Reset crosshair if it moves out of frame
+                    if (crosshair_x < 0 or crosshair_x >= width or
+                        crosshair_y < 0 or crosshair_y >= height):
+                        crosshair_x = width // 2
+                        crosshair_y = height // 2
+
                 prev_angles = (pan, tilt, roll)
 
-        # Clear the mask
-        mask = np.zeros_like(old_frame)
-
-        # Draw the tracks
-        for track in tracks:
-            if len(track) > 1:
-                for i in range(1, len(track)):
-                    pt1 = tuple(map(int, track[i - 1][1]))
-                    pt2 = tuple(map(int, track[i][1]))
+        # Draw tracks
+        mask = np.zeros_like(frame)
+        for track_id, track in tracks.items():
+            points = track['points']
+            if len(points) > 1:
+                for i in range(1, len(points)):
+                    pt1 = tuple(map(int, points[i - 1][1]))
+                    pt2 = tuple(map(int, points[i][1]))
                     cv2.line(mask, pt1, pt2, (0, 255, 0), 2)
 
                 # Draw the current point
-                cv2.circle(frame, tuple(map(int, track[-1][1])), 5, (0, 0, 255), -1)
+                cv2.circle(frame, tuple(map(int, points[-1][1])), 5, (0, 0, 255), -1)
+                # Draw track ID
+                cv2.putText(frame, str(track_id), tuple(map(int, points[-1][1])),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         img = cv2.add(frame, mask)
 
@@ -192,18 +204,17 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
             x1, y1, x2, y2 = map(int, box)
             cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-        # Add text with current angles
-        if prev_angles:
-            cv2.putText(img, f"Pan: {pan:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(img, f"Tilt: {tilt:.2f}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(img, f"Roll: {roll:.2f}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Draw crosshair
+        cv2.line(img, (crosshair_x - crosshair_size, crosshair_y),
+                 (crosshair_x + crosshair_size, crosshair_y), (0, 255, 0), 2)
+        cv2.line(img, (crosshair_x, crosshair_y - crosshair_size),
+                 (crosshair_x, crosshair_y + crosshair_size), (0, 255, 0), 2)
 
-        # Write the frame to debug video
         debug_out.write(img)
 
         # Update the previous frame and points
         old_gray = frame_gray.copy()
-        p0 = good_new.reshape(-1, 1, 2)
+        p0 = np.float32([track['points'][-1][1] for track in tracks.values() if track['points']]).reshape(-1, 1, 2)
 
         frame_count += 1
         pbar.update(1)
