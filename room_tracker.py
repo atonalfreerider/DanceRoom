@@ -80,17 +80,19 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     # Initialize crosshair position
     crosshair_x = width // 2
     crosshair_y = height // 2
-    crosshair_size = 20
+    initial_crosshair_size = 20
+    crosshair_size = initial_crosshair_size
     zoom_factor = 1
 
-    # Initialize crosshair points
-    crosshair_points = np.array([
-        [crosshair_x - crosshair_size, crosshair_y],
-        [crosshair_x + crosshair_size, crosshair_y],
-        [crosshair_x, crosshair_y - crosshair_size],
-        [crosshair_x, crosshair_y + crosshair_size]
-    ])
-    rotated_crosshair = crosshair_points.copy()
+    # Initialize cumulative transformation
+    cumulative_pan = 0.0
+    cumulative_tilt = 0.0
+    cumulative_roll = 0.0
+
+    # Initialize previous rotation and translation
+    prev_rotation_vector = None
+    prev_translation_vector = None
+    prev_good_points = None
 
     while True:
         ret, frame = cap.read()
@@ -161,47 +163,45 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
             )
 
             if success:
-                # Convert rotation vector to Euler angles
+                # Convert rotation vector to rotation matrix
                 rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-                euler_angles = cv2.decomposeProjectionMatrix(np.hstack((rotation_matrix, translation_vector)))[6]
 
+                # Calculate Euler angles
+                euler_angles = \
+                cv2.decomposeProjectionMatrix(np.hstack((rotation_matrix, translation_vector.reshape(3, 1))))[6]
                 pan, tilt, roll = [angle[0] for angle in euler_angles]
 
                 # Calculate zoom factor
-                if frame_count > 0:
+                if prev_good_points is not None and len(prev_good_points) > 0:
                     prev_center = np.mean(prev_good_points, axis=0)
                     curr_center = np.mean(good_points, axis=0)
                     prev_distances = np.linalg.norm(prev_good_points - prev_center, axis=1)
                     curr_distances = np.linalg.norm(good_points - curr_center, axis=1)
                     zoom_factor = np.mean(curr_distances) / np.mean(prev_distances)
+                else:
+                    zoom_factor = 1.0
 
                 # Calculate deltas
-                if prev_angles is not None:
-                    delta_pan = pan - prev_angles[0]
-                    delta_tilt = tilt - prev_angles[1]
-                    delta_roll = roll - prev_angles[2]
-                    delta_zoom = zoom_factor - 1.0  # Change in zoom factor
+                if prev_rotation_vector is not None and prev_translation_vector is not None:
+                    delta_rotation = rotation_vector - prev_rotation_vector
+                    delta_translation = translation_vector - prev_translation_vector
+
+                    delta_pan = float(delta_rotation[1])  # Rotation around y-axis
+                    delta_tilt = float(delta_rotation[0])  # Rotation around x-axis
+                    delta_roll = float(delta_rotation[2])  # Rotation around z-axis
+                    delta_zoom = float(zoom_factor - 1.0)  # Change in zoom factor
+
                     deltas.append({
                         "frame": frame_count,
-                        "delta_pan": float(delta_pan),
-                        "delta_tilt": float(delta_tilt),
-                        "delta_roll": float(delta_roll),
-                        "delta_zoom": float(delta_zoom)
+                        "delta_pan": delta_pan,
+                        "delta_tilt": delta_tilt,
+                        "delta_roll": delta_roll,
+                        "delta_zoom": delta_zoom
                     })
 
-                    # Update crosshair position
-                    crosshair_x += int(delta_pan * 10)  # Adjust multiplier for sensitivity
-                    crosshair_y -= int(delta_tilt * 10)  # Adjust multiplier for sensitivity
-
-                    # Rotate crosshair
-                    rot_matrix = cv2.getRotationMatrix2D((crosshair_x, crosshair_y), delta_roll, 1)
-                    crosshair_points = np.array([
-                        [crosshair_x - crosshair_size, crosshair_y],
-                        [crosshair_x + crosshair_size, crosshair_y],
-                        [crosshair_x, crosshair_y - crosshair_size],
-                        [crosshair_x, crosshair_y + crosshair_size]
-                    ])
-                    rotated_crosshair = cv2.transform(np.array([crosshair_points]), rot_matrix)[0]
+                    # Update crosshair position to stay fixed in world space
+                    crosshair_x += int(delta_pan * focal_length)
+                    crosshair_y -= int(delta_tilt * focal_length)
 
                     # Update crosshair size based on zoom
                     crosshair_size *= zoom_factor
@@ -211,8 +211,31 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
                             crosshair_y < 0 or crosshair_y >= height):
                         crosshair_x = width // 2
                         crosshair_y = height // 2
+                        crosshair_size = initial_crosshair_size * zoom_factor
+                        cumulative_pan = 0.0
+                        cumulative_tilt = 0.0
+                        cumulative_roll = 0.0
+                    else:
+                        cumulative_pan += delta_pan
+                        cumulative_tilt += delta_tilt
+                        cumulative_roll += delta_roll
 
-                prev_angles = (pan, tilt, roll)
+                # Update previous values
+                prev_rotation_vector = rotation_vector
+                prev_translation_vector = translation_vector
+
+        # Calculate crosshair points
+        half_size = int(crosshair_size // 2)
+        crosshair_points = np.array([
+            [crosshair_x - half_size, crosshair_y],
+            [crosshair_x + half_size, crosshair_y],
+            [crosshair_x, crosshair_y - half_size],
+            [crosshair_x, crosshair_y + half_size]
+        ])
+
+        # Rotate crosshair
+        rot_matrix = cv2.getRotationMatrix2D((crosshair_x, crosshair_y), np.degrees(float(cumulative_roll)), 1)
+        rotated_crosshair = cv2.transform(np.array([crosshair_points]), rot_matrix)[0]
 
         # Draw tracks
         mask = np.zeros_like(frame)
@@ -245,7 +268,7 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
         # Update the previous frame and points
         old_gray = frame_gray.copy()
-        prev_good_points = good_points.copy()
+        prev_good_points = good_points.copy() if len(good_points) > 0 else prev_good_points
         p0 = np.float32([track['points'][-1][1] for track in tracks.values() if track['points']]).reshape(-1, 1, 2)
 
         frame_count += 1
