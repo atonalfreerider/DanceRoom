@@ -56,7 +56,7 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     dist_coeffs = np.zeros((4, 1))
 
     # Initialize feature detector and tracker
-    feature_params = dict(qualityLevel=0.3, minDistance=7, blockSize=7)
+    feature_params = dict(qualityLevel=0.01, minDistance=7, blockSize=7)
     lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
     # Read first frame and detect initial features
@@ -67,20 +67,19 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     logo_mask = np.ones(old_gray.shape[:2], dtype=np.uint8)
     logo_mask[0:50, 0:50] = 0  # Assume logo is in top-left corner, adjust as needed
 
-    p0 = cv2.goodFeaturesToTrack(old_gray, maxCorners=100, mask=logo_mask, **feature_params)
+    p0 = cv2.goodFeaturesToTrack(old_gray, maxCorners=500, mask=logo_mask, **feature_params)
 
-    # Create a mask image for drawing purposes
-    mask = np.zeros_like(old_frame)
-
-    # Initialize variables for storing deltas
+    # Initialize variables for storing deltas and tracks
     deltas = []
     prev_angles = None
-    old_points = None
+    tracks = []
+    max_track_length = int(5 * fps)  # 5 seconds of tracks
+
+    frame_count = 0
 
     # Progress bar
     pbar = tqdm(total=total_frames, desc="Processing frames")
 
-    frame_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -88,10 +87,9 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Get COCO detections for the current frame
+        # Get YOLO detections for the current frame
         current_detections = yolo_detections.get(str(frame_count), [])
         current_boxes = [detection["bbox"] for detection in current_detections]
-        current_keypoints = [detection["keypoints"] for detection in current_detections]
 
         # Calculate optical flow
         p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
@@ -101,26 +99,46 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
             good_new = p1[st == 1]
             good_old = p0[st == 1]
 
-            # Filter out points inside COCO detection boxes
+            # Filter out points inside YOLO detection boxes
             good_indices = [i for i, point in enumerate(good_new)
                             if not any(point_in_box(point, box) for box in current_boxes)]
             good_new = good_new[good_indices]
             good_old = good_old[good_indices]
 
             # Filter out static points
-            good_new = filter_static_points(good_new, old_points)
+            good_new = filter_static_points(good_new, good_old)
         else:
             good_new = np.empty((0, 2))
-            good_old = np.empty((0, 2))
 
         # If we don't have enough points, detect new ones
-        while len(good_new) < 20:
+        while len(good_new) < 100:
             additional_points = cv2.goodFeaturesToTrack(frame_gray, mask=logo_mask,
-                                                        maxCorners=20 - len(good_new), **feature_params)
+                                                        maxCorners=500 - len(good_new), **feature_params)
             if additional_points is None:
                 break
             additional_points = additional_points.reshape(-1, 2)
-            good_new = np.vstack((good_new, additional_points.reshape(-1, 2)))
+
+            # Filter out points inside YOLO detection boxes
+            additional_points = [point for point in additional_points
+                                 if not any(point_in_box(point, box) for box in current_boxes)]
+
+            good_new = np.vstack((good_new, additional_points))
+
+        # Ensure we have at least 20 points
+        if len(good_new) > 20:
+            good_new = good_new[:20]
+
+        # Update tracks
+        if len(tracks) < len(good_new):
+            for _ in range(len(good_new) - len(tracks)):
+                tracks.append([])
+
+        for i, new in enumerate(good_new):
+            if i < len(tracks):
+                tracks[i].append((frame_count, tuple(new.ravel())))
+                # Remove old points
+                while tracks[i] and frame_count - tracks[i][0][0] >= max_track_length:
+                    tracks[i].pop(0)
 
         # Estimate camera pose
         if len(good_new) >= 4:
@@ -153,25 +171,26 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
                 prev_angles = (pan, tilt, roll)
 
+        # Clear the mask
+        mask = np.zeros_like(old_frame)
+
         # Draw the tracks
-        for i, (new, old) in enumerate(zip(good_new, good_old)):
-            a, b = new.ravel()
-            c, d = old.ravel()
-            mask = cv2.line(mask, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 2)
-            frame = cv2.circle(frame, (int(a), int(b)), 5, (0, 0, 255), -1)
+        for track in tracks:
+            if len(track) > 1:
+                for i in range(1, len(track)):
+                    pt1 = tuple(map(int, track[i - 1][1]))
+                    pt2 = tuple(map(int, track[i][1]))
+                    cv2.line(mask, pt1, pt2, (0, 255, 0), 2)
+
+                # Draw the current point
+                cv2.circle(frame, tuple(map(int, track[-1][1])), 5, (0, 0, 255), -1)
 
         img = cv2.add(frame, mask)
 
-        # Draw COCO detection boxes and keypoints
-        for box, keypoints in zip(current_boxes, current_keypoints):
+        # Draw YOLO detection boxes
+        for box in current_boxes:
             x1, y1, x2, y2 = map(int, box)
             cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-
-            # Draw keypoints
-            for kp in keypoints:
-                x, y, conf = kp
-                if conf > 0:  # Only draw keypoints with confidence > 0
-                    cv2.circle(img, (int(x), int(y)), 3, (0, 255, 255), -1)
 
         # Add text with current angles
         if prev_angles:
@@ -185,7 +204,6 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
         # Update the previous frame and points
         old_gray = frame_gray.copy()
         p0 = good_new.reshape(-1, 1, 2)
-        old_points = good_new.copy()  # Make a copy to ensure we're not modifying the same array
 
         frame_count += 1
         pbar.update(1)
