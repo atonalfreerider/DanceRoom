@@ -1,7 +1,9 @@
+import os
 import cv2
 import numpy as np
 import json
 from tqdm import tqdm
+from scipy.signal import savgol_filter
 
 
 def estimate_transform(src_points, dst_points):
@@ -15,15 +17,33 @@ def estimate_transform(src_points, dst_points):
     return 0, 0, 0, 1, None
 
 
-def room_tracker(input_path, output_path, debug_output_path, yolo_detections_path):
-    yolo_detections = load_yolo_detections(yolo_detections_path)
+def smooth_values(values, window_size=15, poly_order=3):
+    return savgol_filter(values, window_size, poly_order)
+
+
+def flatten_zoom(zoom_values, threshold=0.001):
+    flattened = np.zeros_like(zoom_values)
+    cumulative_zoom = 1.0
+    for i, zoom in enumerate(zoom_values):
+        if abs(zoom - 1) > threshold:
+            flattened[i] = zoom
+            cumulative_zoom *= zoom
+        else:
+            flattened[i] = 1.0
+    return flattened, cumulative_zoom
+
+
+def room_tracker(input_path, output_dir):
+    # if the deltas.json file already exists, skip this step
+    if os.path.exists(output_dir + "/deltas.json"):
+        print("Deltas file already exists. Skipping room tracking.")
+        return
+
+    yolo_detections_path = output_dir + "/detections.json"
+    yolo_detections = load_json(yolo_detections_path)
     cap = cv2.VideoCapture(input_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-
-    debug_out = cv2.VideoWriter(debug_output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
     feature_params = dict(qualityLevel=0.01, minDistance=7, blockSize=7)
     lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
@@ -35,11 +55,6 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     next_track_id = 0
     max_track_length = int(5 * fps)
     deltas = []
-
-    crosshair_x = float(width // 2)
-    crosshair_y = float(height // 2)
-    initial_crosshair_size = 20.0
-    crosshair_size = initial_crosshair_size
 
     pbar = tqdm(total=total_frames, desc="Processing frames")
 
@@ -99,6 +114,7 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
         good_new, good_old = np.array(good_new), np.array(good_old)
 
+        delta_added = False
         if len(good_new) >= 4 and len(good_old) >= 4:
             # require 4 consistent points to do frame transform tracking
             dx, dy, rotation, scale, inliers = estimate_transform(good_old, good_new)
@@ -113,48 +129,111 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
                     "delta_roll": float(rotation),
                     "delta_zoom": float(delta_zoom)
                 })
+                delta_added = True
 
-                crosshair_x += float(dx)  # Move in opposite direction of camera motion
-                crosshair_y += float(dy)  # Move in opposite direction of camera motion
-                crosshair_size *= scale
+        if not delta_added:
+            deltas.append({
+                "frame": frame_count,
+                "delta_x": 0.0,
+                "delta_y": 0.0,
+                "delta_roll": 0.0,
+                "delta_zoom": 0.0
+            })
 
-                if crosshair_x < 0 or crosshair_x >= width or crosshair_y < 0 or crosshair_y >= height:
-                    crosshair_x, crosshair_y = float(width // 2), float(height // 2)
-                    crosshair_size = initial_crosshair_size
-
-        mask = np.zeros_like(frame)
-        for track_id, track in tracks.items():
-            points = track['points']
-            if len(points) > 1:
-                # draw points and lines
-                for i in range(1, len(points)):
-                    pt1 = tuple(map(int, points[i - 1][1]))
-                    pt2 = tuple(map(int, points[i][1]))
-                    cv2.line(mask, pt1, pt2, (0, 255, 0), 2)
-                cv2.circle(frame, tuple(map(int, points[-1][1])), 5, (0, 0, 255), -1)
-                cv2.putText(frame, str(track_id), tuple(map(int, points[-1][1])),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        img = cv2.add(frame, mask)
-
-        half_size = int(crosshair_size // 2)
-        cv2.line(img, (int(crosshair_x) - half_size, int(crosshair_y)), (int(crosshair_x) + half_size, int(crosshair_y)), (0, 255, 0), 2)
-        cv2.line(img, (int(crosshair_x), int(crosshair_y) - half_size), (int(crosshair_x), int(crosshair_y) + half_size), (0, 255, 0), 2)
-
-        debug_out.write(img)
         old_gray = frame_gray.copy()
         pbar.update(1)
 
     cap.release()
-    debug_out.release()
     pbar.close()
 
+    # Smooth and process the collected data
+    rolls = smooth_values([d['delta_roll'] for d in deltas])
+    zooms, cumulative_zoom = flatten_zoom([d['delta_zoom'] + 1 for d in deltas])
+
+    # Update the deltas with smoothed values
+    for i, delta in enumerate(deltas):
+        delta['delta_roll'] = float(rolls[i])
+        delta['delta_zoom'] = float(zooms[i] - 1)
+
+    output_path = output_dir + "/deltas.json"
     with open(output_path, 'w') as f:
         json.dump(deltas, f, indent=2)
     print(f"Successfully wrote deltas to {output_path}")
 
 
-def load_yolo_detections(json_path):
+def debug_video(input_path, output_dir, deltas_path):
+    debug_output_path = output_dir + "/debug-points.mp4"
+    if os.path.exists(debug_output_path):
+        print("Debug video already exists. Skipping debug video creation.")
+        return
+
+    deltas = load_json(deltas_path)
+
+    cap = cv2.VideoCapture(input_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+
+    debug_out = cv2.VideoWriter(debug_output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+
+    crosshair_x = float(width // 2)
+    crosshair_y = float(height // 2)
+    crosshair_size = 20.0
+    crosshair_roll = 0.0
+
+    pbar = tqdm(total=total_frames, desc="Rendering crosshair frames")
+
+    for frame_count in range(total_frames):
+        ret, frame = cap.read()
+        if not ret or frame_count >= len(deltas):
+            break
+
+        # Get the delta for this frame
+        delta = deltas[frame_count]
+        dx, dy = delta['delta_x'], delta['delta_y']
+        rotation = delta['delta_roll']
+        scale = delta['delta_zoom'] + 1
+
+        crosshair_x += float(dx)
+        crosshair_y += float(dy)
+        crosshair_size *= scale
+        crosshair_roll += rotation
+
+        if crosshair_x < 0 or crosshair_x >= width or crosshair_y < 0 or crosshair_y >= height:
+            # Reset crosshair if it goes out of bounds
+            crosshair_x, crosshair_y = float(width // 2), float(height // 2)
+
+        half_size = int(crosshair_size // 2)
+        center = (int(crosshair_x), int(crosshair_y))
+        rotation_matrix = cv2.getRotationMatrix2D(center, np.degrees(crosshair_roll), 1)
+
+        p1 = np.array([center[0] - half_size, center[1], 1])
+        p2 = np.array([center[0] + half_size, center[1], 1])
+        p3 = np.array([center[0], center[1] - half_size, 1])
+        p4 = np.array([center[0], center[1] + half_size, 1])
+
+        p1_rotated = rotation_matrix.dot(p1)
+        p2_rotated = rotation_matrix.dot(p2)
+        p3_rotated = rotation_matrix.dot(p3)
+        p4_rotated = rotation_matrix.dot(p4)
+
+        img = frame.copy()
+        cv2.line(img, tuple(p1_rotated[:2].astype(int)), tuple(p2_rotated[:2].astype(int)), (0, 255, 0), 2)
+        cv2.line(img, tuple(p3_rotated[:2].astype(int)), tuple(p4_rotated[:2].astype(int)), (0, 255, 0), 2)
+
+        debug_out.write(img)
+
+        pbar.update(1)
+
+    cap.release()
+    pbar.close()
+    debug_out.release()
+    print(f"Successfully wrote debug video to {debug_output_path}")
+
+
+def load_json(json_path):
     with open(json_path, 'r') as f:
         return json.load(f)
 
