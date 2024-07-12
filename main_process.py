@@ -15,7 +15,7 @@ def main(input_video, output_dir):
     #segmenter = Segmenter(input_video, output_dir)
     #segmenter.process_video()
 
-    deltas = room_tracker.room_tracker(input_video, output_dir + "/deltas.json", output_dir + "/debug-points.mp4", output_dir + "/detections.json")
+    room_tracker.room_tracker(input_video, output_dir + "/deltas.json", output_dir + "/debug-points.mp4", output_dir + "/detections.json")
 
     # Step 1: Segment people, create background-only video, and save masks and poses
     #dancer_tracker = DancerTracker(input_video, output_dir)

@@ -4,35 +4,6 @@ import json
 from tqdm import tqdm
 
 
-def load_yolo_detections(json_path):
-    with open(json_path, 'r') as f:
-        return json.load(f)
-
-
-def point_in_box(point, box):
-    x, y = point
-    x1, y1, x2, y2 = box
-    return x1 < x < x2 and y1 < y < y2
-
-
-def filter_static_points(points, old_points, threshold=0.1):
-    if old_points is None or len(points) != len(old_points):
-        return points, old_points
-
-    # Convert lists to numpy arrays if they're not already
-    points = np.array(points)
-    old_points = np.array(old_points)
-
-    # Calculate distances between points and old_points
-    distances = np.linalg.norm(points - old_points, axis=1)
-
-    # Create a mask for non-static points
-    non_static_mask = distances > threshold
-
-    # Return filtered points and old_points
-    return points[non_static_mask], old_points[non_static_mask]
-
-
 def estimate_transform(src_points, dst_points):
     transform_matrix, inliers = cv2.estimateAffinePartial2D(src_points, dst_points, method=cv2.RANSAC,
                                                             ransacReprojThreshold=3.0)
@@ -67,8 +38,8 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
     crosshair_x = float(width // 2)
     crosshair_y = float(height // 2)
-    initial_crosshair_size = 20
-    crosshair_size = float(initial_crosshair_size)
+    initial_crosshair_size = 20.0
+    crosshair_size = initial_crosshair_size
 
     pbar = tqdm(total=total_frames, desc="Processing frames")
 
@@ -86,6 +57,8 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
         # Calculate optical flow for existing tracks
         if tracks:
             prev_points = np.float32([track['points'][-1][1] for track in tracks.values()]).reshape(-1, 1, 2)
+
+            # optical flow takes the points from last frame and finds them in this frame
             curr_points, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, prev_points, None, **lk_params)
 
             good_new, good_old = [], []
@@ -93,6 +66,7 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
             for (track_id, track), (new, status) in zip(list(tracks.items()), zip(curr_points, st.ravel())):
                 if status and not any(point_in_box(new[0], box) for box in current_boxes):
+                    # only track points that are not inside of bounding boxes
                     track['points'].append((frame_count, tuple(new.ravel())))
                     track['last_seen'] = frame_count
                     while track['points'] and frame_count - track['points'][0][0] >= max_track_length:
@@ -107,11 +81,13 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
             good_new, good_old = filter_static_points(good_new, good_old)
 
         if len(tracks) < 20:
+            # top up points to 20, including points tracked on people
             mask = np.ones(frame_gray.shape[:2], dtype=np.uint8)
             for track in tracks.values():
                 x, y = map(int, track['points'][-1][1])
                 cv2.circle(mask, (x, y), 10, 0, -1)
             for box in current_boxes:
+                # mask out points in people bounding boxes
                 x1, y1, x2, y2 = map(int, box)
                 cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
 
@@ -124,6 +100,7 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
         good_new, good_old = np.array(good_new), np.array(good_old)
 
         if len(good_new) >= 4 and len(good_old) >= 4:
+            # require 4 consistent points to do frame transform tracking
             dx, dy, rotation, scale, inliers = estimate_transform(good_old, good_new)
 
             if inliers is not None:
@@ -143,12 +120,13 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
 
                 if crosshair_x < 0 or crosshair_x >= width or crosshair_y < 0 or crosshair_y >= height:
                     crosshair_x, crosshair_y = float(width // 2), float(height // 2)
-                    crosshair_size = float(initial_crosshair_size)
+                    crosshair_size = initial_crosshair_size
 
         mask = np.zeros_like(frame)
         for track_id, track in tracks.items():
             points = track['points']
             if len(points) > 1:
+                # draw points and lines
                 for i in range(1, len(points)):
                     pt1 = tuple(map(int, points[i - 1][1]))
                     pt2 = tuple(map(int, points[i][1]))
@@ -171,12 +149,35 @@ def room_tracker(input_path, output_path, debug_output_path, yolo_detections_pat
     debug_out.release()
     pbar.close()
 
-    try:
-        with open(output_path, 'w') as f:
-            json.dump(deltas, f, indent=2)
-        print(f"Successfully wrote deltas to {output_path}")
-    except Exception as e:
-        print(f"Error writing JSON file: {str(e)}")
-        print("Returning deltas as a list instead.")
+    with open(output_path, 'w') as f:
+        json.dump(deltas, f, indent=2)
+    print(f"Successfully wrote deltas to {output_path}")
 
-    return deltas
+
+def load_yolo_detections(json_path):
+    with open(json_path, 'r') as f:
+        return json.load(f)
+
+
+def point_in_box(point, box):
+    x, y = point
+    x1, y1, x2, y2 = box
+    return x1 < x < x2 and y1 < y < y2
+
+
+def filter_static_points(points, old_points, threshold=0.1):
+    if old_points is None or len(points) != len(old_points):
+        return points, old_points
+
+    # Convert lists to numpy arrays if they're not already
+    points = np.array(points)
+    old_points = np.array(old_points)
+
+    # Calculate distances between points and old_points
+    distances = np.linalg.norm(points - old_points, axis=1)
+
+    # Create a mask for non-static points
+    non_static_mask = distances > threshold
+
+    # Return filtered points and old_points
+    return points[non_static_mask], old_points[non_static_mask]
