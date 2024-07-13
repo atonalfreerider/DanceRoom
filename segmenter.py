@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 from tqdm import tqdm
+from scipy.signal import savgol_filter
 
 
 class Segmenter:
@@ -15,38 +16,68 @@ class Segmenter:
         os.makedirs(self.figure_mask_dir, exist_ok=True)
 
     def process_video(self):
-        # Open the video file
         cap = cv2.VideoCapture(self.video_path)
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        pbar = tqdm(total=total_frames, desc="Segmenting video based on depth")
+
+        # List to store D values for each frame
+        D_values = []
+
+        # First pass: Calculate D values for each frame
+        pbar = tqdm(total=total_frames, desc="Calculating D values")
+        for frame_count in range(total_frames):
+            depth_map = self.load_depth_map(int(frame_count))
+            if depth_map is None:
+                D_values.append(None)
+                pbar.update(1)
+                continue
+
+            max_contrast = 0
+            D = None
+            for row in depth_map:
+                sorted_row = np.sort(row)
+                contrast = np.sum(sorted_row[::-1] - sorted_row)
+                if contrast > max_contrast:
+                    max_contrast = contrast
+                    D = sorted_row[0]  # Closest depth value in the row with highest contrast
+
+            D_values.append(D)
+            pbar.update(1)
+
+        pbar.close()
+
+        # Remove None values and apply smoothing
+        D_values_filtered = [d for d in D_values if d is not None]
+        if len(D_values_filtered) > 0:
+            smoothed_D = savgol_filter(D_values_filtered,
+                                       window_length=min(51, len(D_values_filtered)),
+                                       polyorder=3)
+        else:
+            print("Warning: No valid D values found.")
+            return
+
+        # Second pass: Create masks using smoothed D values
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        pbar = tqdm(total=total_frames, desc="Creating masks")
         for frame_count in range(total_frames):
             ret, frame = cap.read()
             if not ret:
                 break
             depth_map = self.load_depth_map(int(frame_count))
-            if depth_map is None:
+            if depth_map is None or D_values[frame_count] is None:
+                pbar.update(1)
                 continue
 
-            # Scale the depth map to match the frame size
             scaled_depth = cv2.resize(depth_map, (frame_width, frame_height), interpolation=cv2.INTER_LINEAR)
 
-            # Find the max and min depths for each row
-            max_depths = np.max(scaled_depth, axis=1)
-            min_depths = np.min(scaled_depth, axis=1)
+            D = smoothed_D[frame_count]
+            mask = ((scaled_depth >= D - 2) & (scaled_depth <= D + 2)).astype(np.uint8) * 255
 
-            # Create a mask for rows where max_depth / min_depth >= 1.5
-            valid_rows = max_depths / min_depths >= 1.5
-
-            # Create the initial mask
-            mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-
-            # For valid rows, mark pixels where depth < min_depth * 1.5
-            row_indices, col_indices = np.where(
-                valid_rows[:, np.newaxis] & (scaled_depth < min_depths[:, np.newaxis] * 1.5))
-            mask[row_indices, col_indices] = 255
+            # Optional: Apply some morphological operations to clean up the mask
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
             # Apply the mask to the frame
             masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
@@ -57,11 +88,8 @@ class Segmenter:
 
             pbar.update(1)
 
-        # Release the video capture object
         cap.release()
         pbar.close()
-
-        print("Video processing completed.")
         print("Video processing completed.")
 
     def load_depth_map(self, frame_num):
