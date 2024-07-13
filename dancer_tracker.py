@@ -96,21 +96,27 @@ class DancerTracker:
             # Match the gender identification with each pose in the frame
             men_women_in_frame = self.men_women.get(frame_num, {'men': [], 'women': []})
             for detection in detections_in_frame:
-                x, y = detection[0][0], detection[0][1]  # Assuming first keypoint is a good reference
-                for man in men_women_in_frame['men']:
-                    if man[0] <= x <= man[2] and man[1] <= y <= man[3]:
-                        detection.append({'gender': 'male', 'confidence': man[4]})
-                        break
-                else:
-                    for woman in men_women_in_frame['women']:
-                        if woman[0] <= x <= woman[2] and woman[1] <= y <= woman[3]:
-                            detection.append({'gender': 'female', 'confidence': woman[4]})
+                keypoints = detection.get('keypoints', [])
+                if keypoints:
+                    x, y = keypoints[0][0], keypoints[0][1]  # Using the first keypoint as reference
+                    for man in men_women_in_frame['men']:
+                        if man[0] <= x <= man[2] and man[1] <= y <= man[3]:
+                            detection['gender'] = {'gender': 'male', 'confidence': man[4]}
                             break
                     else:
-                        detection.append({'gender': 'unknown', 'confidence': 0})
+                        for woman in men_women_in_frame['women']:
+                            if woman[0] <= x <= woman[2] and woman[1] <= y <= woman[3]:
+                                detection['gender'] = {'gender': 'female', 'confidence': woman[4]}
+                                break
+                        else:
+                            detection['gender'] = {'gender': 'unknown', 'confidence': 0}
+                else:
+                    detection['gender'] = {'gender': 'unknown', 'confidence': 0}
 
-            # convert to torch tensor
-            detections_in_frame_torch = torch.tensor(detections_in_frame, dtype=torch.float32)
+            # convert to torch tensor (only bbox and score)
+            detections_in_frame_torch = torch.tensor(
+                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], 1.0] for d in detections_in_frame], # score is 1.0. not sure if this will affect results
+                dtype=torch.float32)
 
             if len(detections_in_frame_torch) > 0:
                 img_info = [frame_height, frame_width]
@@ -126,7 +132,7 @@ class DancerTracker:
                     tlwh = t.tlwh
                     center_x, center_y = tlwh[0] + tlwh[2] / 2, tlwh[1] + tlwh[3] / 2
                     closest_pose = min(detections_in_frame,
-                                       key=lambda p: self.distance_to_center(p[0], center_x, center_y))
+                                       key=lambda p: self.distance_to_center(p['keypoints'], center_x, center_y))
 
                     tracked_sequences[track_id].append((frame_num, closest_pose))
             else:
@@ -139,7 +145,7 @@ class DancerTracker:
         for track_id, sequence in tracked_sequences.items():
             gender_votes = {'male': 0, 'female': 0}
             for _, pose in sequence:
-                gender_info = pose[-1]
+                gender_info = pose['gender']
                 if gender_info['gender'] in gender_votes:
                     gender_votes[gender_info['gender']] += gender_info['confidence']
 
@@ -168,20 +174,21 @@ class DancerTracker:
 
         if lead_track:
             for frame_num, pose in tracked_sequences[lead_track]['sequence']:
-                lead_data[str(frame_num)] = pose[:-1]  # Exclude the gender info
+                lead_data[str(frame_num)] = pose['keypoints']
 
         if follow_track:
             for frame_num, pose in tracked_sequences[follow_track]['sequence']:
-                follow_data[str(frame_num)] = pose[:-1]  # Exclude the gender info
+                follow_data[str(frame_num)] = pose['keypoints']
 
         self.save_json(lead_data, self.lead_file)
         self.save_json(follow_data, self.follow_file)
+        self.save_json(tracked_sequences, os.path.join(self.output_dir, 'tracked_sequences.json'))
 
         print(f"Saved lead and follow tracks. Lead frames: {len(lead_data)}, Follow frames: {len(follow_data)}")
 
     @staticmethod
-    def distance_to_center(pose, center_x, center_y):
-        valid_points = [p[:2] for p in pose if p[2] > 0]
+    def distance_to_center(keypoints, center_x, center_y):
+        valid_points = [p[:2] for p in keypoints if p[2] > 0]
         if not valid_points:
             return float('inf')
         pose_center_x = sum(p[0] for p in valid_points) / len(valid_points)
@@ -217,23 +224,44 @@ class DancerTracker:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(debug_video_path, fourcc, fps, (frame_width, frame_height))
 
+        # Load tracked sequences
+        tracked_sequences = self.load_json(os.path.join(self.output_dir, 'tracked_sequences.json'))
+        lead_track = self.load_json(self.lead_file)
+        follow_track = self.load_json(self.follow_file)
+
         frame_count = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            poses = self.detections.get(str(frame_count), [])
-            for pose in poses:
-                self.draw_pose(frame, pose["keypoints"], (128, 128, 128))  # Gray for all poses
+            # Draw all tracked poses
+            for track_id, track_info in tracked_sequences.items():
+                pose = next((p for f, p in track_info['sequence'] if f == frame_count), None)
+                if pose:
+                    color = (255, 0, 255) if track_info['gender'] == 'female' else (255, 0, 0)
+                    self.draw_pose(frame, pose['keypoints'], color)
 
-            lead_pose = self.lead.get(str(frame_count))
+                    # Draw bounding box
+                    x1, y1, x2, y2 = pose['bbox']
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+
+                    # Put track ID text
+                    cv2.putText(frame, f"ID: {track_id}", (int(x1), int(y1) - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            # Draw lead and follow
+            lead_pose = lead_track.get(str(frame_count))
             if lead_pose:
-                self.draw_pose(frame, lead_pose, (255, 0, 0), is_lead_or_follow=True)  # Blue for lead man
+                self.draw_pose(frame, lead_pose, (0, 0, 255), is_lead_or_follow=True)  # Red for lead
+                cv2.putText(frame, "LEAD", (int(lead_pose[0][0]), int(lead_pose[0][1]) - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            follow_pose = self.follow.get(str(frame_count))
+            follow_pose = follow_track.get(str(frame_count))
             if follow_pose:
-                self.draw_pose(frame, follow_pose, (0, 255, 0), is_lead_or_follow=True)  # Green for follow woman
+                self.draw_pose(frame, follow_pose, (255, 192, 203), is_lead_or_follow=True)  # Pink for follow
+                cv2.putText(frame, "FOLLOW", (int(follow_pose[0][0]), int(follow_pose[0][1]) - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)
 
             out.write(frame)
 
@@ -257,34 +285,16 @@ class DancerTracker:
             (5, 11), (6, 12), (11, 13), (12, 14), (13, 15), (14, 16)  # Legs
         ]
 
-        overlay = np.zeros_like(image, dtype=np.uint8)
-
-        def get_point_and_conf(kp):
-            if len(kp) == 4 and (kp[0] != 0 or kp[1] != 0):
-                return (int(kp[0]), int(kp[1])), kp[3]  # x, y, z, conf
-            elif len(kp) == 3 and (kp[0] != 0 or kp[1] != 0):
-                return (int(kp[0]), int(kp[1])), kp[2]  # x, y, conf
-            return None, 0.0
-
         line_thickness = 3 if is_lead_or_follow else 1
 
         for connection in connections:
-            if len(pose) > max(connection):
-                start_point, start_conf = get_point_and_conf(pose[connection[0]])
-                end_point, end_conf = get_point_and_conf(pose[connection[1]])
-
-                if start_point is not None and end_point is not None:
-                    avg_conf = (start_conf + end_conf) / 2
-                    color_with_alpha = tuple(int(c * avg_conf) for c in color)
-                    cv2.line(overlay, start_point, end_point, color_with_alpha, line_thickness)
+            start_point = tuple(map(int, pose[connection[0]][:2]))
+            end_point = tuple(map(int, pose[connection[1]][:2]))
+            cv2.line(image, start_point, end_point, color, line_thickness)
 
         for point in pose:
-            pt, conf = get_point_and_conf(point)
-            if pt is not None:
-                color_with_alpha = tuple(int(c * conf) for c in color)
-                cv2.circle(overlay, pt, 3, color_with_alpha, -1)
-
-        cv2.add(image, overlay, image)
+            pt = tuple(map(int, point[:2]))
+            cv2.circle(image, pt, 3, color, -1)
 
     def numpy_to_python(self, obj):
         if isinstance(obj, np.integer):
