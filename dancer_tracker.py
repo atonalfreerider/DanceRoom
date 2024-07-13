@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 from yolox.tracker.byte_tracker import BYTETracker
 import torch
+import tqdm
 
 
 class BYTETrackerArgs:
@@ -48,6 +49,7 @@ class DancerTracker:
         cap = cv2.VideoCapture(self.input_path)
         frame_count = 0
 
+        pbar = tqdm.tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), desc="Detecting men and women")
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -70,8 +72,10 @@ class DancerTracker:
 
             self.men_women[frame_count] = {'men': men, 'women': women}
             frame_count += 1
+            pbar.update(1)
 
         cap.release()
+        pbar.close()
         self.save_json(self.men_women, self.men_women_file)
         print(f"Saved men-women detections for {frame_count} frames.")
 

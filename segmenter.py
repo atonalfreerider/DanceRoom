@@ -16,6 +16,11 @@ class Segmenter:
         os.makedirs(self.figure_mask_dir, exist_ok=True)
 
     def process_video(self):
+        # return if mask dir already contains files
+        if len(os.listdir(self.figure_mask_dir)) > 0:
+            print("Figure masks already exist. Skipping video processing.")
+            return
+
         cap = cv2.VideoCapture(self.video_path)
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

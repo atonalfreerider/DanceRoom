@@ -10,10 +10,11 @@ from dancer_tracker import DancerTracker
 def main(input_video, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
-    yoloPose = yolo_pose.YOLOPose(input_video, output_dir + "/detections.json")
+    segmenter = Segmenter(input_video, output_dir)
+    segmenter.process_video()
+
+    yoloPose = yolo_pose.YOLOPose(output_dir + "/figure-masks", output_dir + "/detections.json")
     yoloPose.detect_poses()
-    #segmenter = Segmenter(input_video, output_dir)
-    #segmenter.process_video()
 
     room_tracker.room_tracker(input_video, output_dir)
     room_tracker.debug_video(input_video, output_dir, output_dir + "/deltas.json")
