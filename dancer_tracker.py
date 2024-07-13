@@ -92,13 +92,28 @@ class DancerTracker:
         # first, track the poses through the frames using ByteTracker and also identify genders
         for frame_num in range(frame_count):
             detections_in_frame = self.detections.get(str(frame_num), [])
-            # TODO match the gender identification with the each pose in the frame
+
+            # Match the gender identification with each pose in the frame
+            men_women_in_frame = self.men_women.get(frame_num, {'men': [], 'women': []})
+            for detection in detections_in_frame:
+                x, y = detection[0][0], detection[0][1]  # Assuming first keypoint is a good reference
+                for man in men_women_in_frame['men']:
+                    if man[0] <= x <= man[2] and man[1] <= y <= man[3]:
+                        detection.append({'gender': 'male', 'confidence': man[4]})
+                        break
+                else:
+                    for woman in men_women_in_frame['women']:
+                        if woman[0] <= x <= woman[2] and woman[1] <= y <= woman[3]:
+                            detection.append({'gender': 'female', 'confidence': woman[4]})
+                            break
+                    else:
+                        detection.append({'gender': 'unknown', 'confidence': 0})
 
             # convert to torch tensor
             detections_in_frame_torch = torch.tensor(detections_in_frame, dtype=torch.float32)
 
             if len(detections_in_frame_torch) > 0:
-                img_info = [frame_height, frame_width]  # Changed to list
+                img_info = [frame_height, frame_width]
                 img_size = [frame_height, frame_width]
                 online_targets = tracker.update(detections_in_frame_torch, img_info, img_size)
 
@@ -108,10 +123,10 @@ class DancerTracker:
                     if track_id not in tracked_sequences:
                         tracked_sequences[track_id] = []
 
-                    # Find the closest pose to the tracked object
                     tlwh = t.tlwh
                     center_x, center_y = tlwh[0] + tlwh[2] / 2, tlwh[1] + tlwh[3] / 2
-                    closest_pose = min(detections_in_frame, key=lambda p: self.distance_to_center(p[0], center_x, center_y))
+                    closest_pose = min(detections_in_frame,
+                                       key=lambda p: self.distance_to_center(p[0], center_x, center_y))
 
                     tracked_sequences[track_id].append((frame_num, closest_pose))
             else:
@@ -120,16 +135,49 @@ class DancerTracker:
 
         pbar.close()
 
-        # TODO in the sequence of all tracked poses, vote on the gender of the tracked person based on the majority of
-        #  highest confidence gender detections, and assign this gender to the track
+        # Vote on the gender of the tracked person based on the majority of highest confidence gender detections
+        for track_id, sequence in tracked_sequences.items():
+            gender_votes = {'male': 0, 'female': 0}
+            for _, pose in sequence:
+                gender_info = pose[-1]
+                if gender_info['gender'] in gender_votes:
+                    gender_votes[gender_info['gender']] += gender_info['confidence']
 
+            tracked_sequences[track_id] = {
+                'gender': max(gender_votes, key=gender_votes.get),
+                'sequence': sequence
+            }
 
+        # Reduce the tracks down to only two people per frame (1 man and 1 woman)
+        lead_track = None
+        follow_track = None
+        max_male_length = 0
+        max_female_length = 0
 
+        for track_id, track_info in tracked_sequences.items():
+            if track_info['gender'] == 'male' and len(track_info['sequence']) > max_male_length:
+                lead_track = track_id
+                max_male_length = len(track_info['sequence'])
+            elif track_info['gender'] == 'female' and len(track_info['sequence']) > max_female_length:
+                follow_track = track_id
+                max_female_length = len(track_info['sequence'])
 
-        # TODO reduce the tracks down to only two people per frame. There should only be 1 man and 1 woman tracked
-        #  through the sequence. Once this is done, save the lead and follow tracks to the lead.json and follow.json
+        # Save the lead and follow tracks
+        lead_data = {}
+        follow_data = {}
 
+        if lead_track:
+            for frame_num, pose in tracked_sequences[lead_track]['sequence']:
+                lead_data[str(frame_num)] = pose[:-1]  # Exclude the gender info
 
+        if follow_track:
+            for frame_num, pose in tracked_sequences[follow_track]['sequence']:
+                follow_data[str(frame_num)] = pose[:-1]  # Exclude the gender info
+
+        self.save_json(lead_data, self.lead_file)
+        self.save_json(follow_data, self.follow_file)
+
+        print(f"Saved lead and follow tracks. Lead frames: {len(lead_data)}, Follow frames: {len(follow_data)}")
 
     @staticmethod
     def distance_to_center(pose, center_x, center_y):
