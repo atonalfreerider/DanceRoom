@@ -20,8 +20,8 @@ def main(input_video, output_dir):
     room_tracker.debug_video(input_video, output_dir, output_dir + "/deltas.json")
 
     # Step 1: Segment people, create background-only video, and save masks and poses
-    #dancer_tracker = DancerTracker(input_video, output_dir)
-    #dancer_tracker.process_video()
+    dancer_tracker = DancerTracker(input_video, output_dir)
+    dancer_tracker.process_video()
 
 
 if __name__ == "__main__":
