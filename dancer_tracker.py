@@ -89,33 +89,42 @@ class DancerTracker:
         frame_count = len(os.listdir(self.figure_mask_dir))
         pbar = tqdm.tqdm(total=frame_count, desc="tracking poses")
 
-        # first, track the poses through the frames using ByteTracker and also identify genders
         for frame_num in range(frame_count):
             detections_in_frame = self.detections.get(str(frame_num), [])
 
-            # Match the gender identification with each pose in the frame
             men_women_in_frame = self.men_women.get(frame_num, {'men': [], 'women': []})
             for detection in detections_in_frame:
-                keypoints = detection.get('keypoints', [])
-                if keypoints:
-                    x, y = keypoints[0][0], keypoints[0][1]  # Using the first keypoint as reference
+                bbox = detection.get('bbox', [])
+                if bbox:
+                    x, y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2  # Center of the bbox
+
+                    # Match the box to the closest gender bbox and assign the gender and confidence
+                    min_distance = float('inf')
+                    gender = 'unknown'
+                    confidence = 0
+
                     for man in men_women_in_frame['men']:
-                        if man[0] <= x <= man[2] and man[1] <= y <= man[3]:
-                            detection['gender'] = {'gender': 'male', 'confidence': man[4]}
-                            break
-                    else:
-                        for woman in men_women_in_frame['women']:
-                            if woman[0] <= x <= woman[2] and woman[1] <= y <= woman[3]:
-                                detection['gender'] = {'gender': 'female', 'confidence': woman[4]}
-                                break
-                        else:
-                            detection['gender'] = {'gender': 'unknown', 'confidence': 0}
+                        man_center_x, man_center_y = (man[0] + man[2]) / 2, (man[1] + man[3]) / 2
+                        distance = ((x - man_center_x) ** 2 + (y - man_center_y) ** 2) ** 0.5
+                        if distance < min_distance:
+                            min_distance = distance
+                            gender = 'male'
+                            confidence = man[4]
+
+                    for woman in men_women_in_frame['women']:
+                        woman_center_x, woman_center_y = (woman[0] + woman[2]) / 2, (woman[1] + woman[3]) / 2
+                        distance = ((x - woman_center_x) ** 2 + (y - woman_center_y) ** 2) ** 0.5
+                        if distance < min_distance:
+                            min_distance = distance
+                            gender = 'female'
+                            confidence = woman[4]
+
+                    detection['gender'] = {'gender': gender, 'confidence': confidence}
                 else:
                     detection['gender'] = {'gender': 'unknown', 'confidence': 0}
 
-            # convert to torch tensor (only bbox and score)
             detections_in_frame_torch = torch.tensor(
-                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], 1.0] for d in detections_in_frame], # score is 1.0. not sure if this will affect results
+                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], 1.0] for d in detections_in_frame],
                 dtype=torch.float32)
 
             if len(detections_in_frame_torch) > 0:
@@ -123,18 +132,29 @@ class DancerTracker:
                 img_size = [frame_height, frame_width]
                 online_targets = tracker.update(detections_in_frame_torch, img_info, img_size)
 
-                # Update tracked sequences
+                # Create a dictionary to store the best pose for each track
+                best_poses = {}
+
                 for t in online_targets:
                     track_id = t.track_id
-                    if track_id not in tracked_sequences:
-                        tracked_sequences[track_id] = []
-
                     tlwh = t.tlwh
                     center_x, center_y = tlwh[0] + tlwh[2] / 2, tlwh[1] + tlwh[3] / 2
+
+                    # Find the closest pose for this track
                     closest_pose = min(detections_in_frame,
                                        key=lambda p: self.distance_to_center(p['keypoints'], center_x, center_y))
+                    closest_distance = self.distance_to_center(closest_pose['keypoints'], center_x, center_y)
 
-                    tracked_sequences[track_id].append((frame_num, closest_pose))
+                    # Check if this pose is the best for this track
+                    if track_id not in best_poses or closest_distance < best_poses[track_id][1]:
+                        best_poses[track_id] = (closest_pose, closest_distance)
+
+                # Update tracked sequences with the best pose for each track
+                for track_id, (best_pose, _) in best_poses.items():
+                    if track_id not in tracked_sequences:
+                        tracked_sequences[track_id] = []
+                    tracked_sequences[track_id].append((frame_num, best_pose))
+
             else:
                 print(f"No detections for frame {frame_num}")
             pbar.update(1)
@@ -285,16 +305,34 @@ class DancerTracker:
             (5, 11), (6, 12), (11, 13), (12, 14), (13, 15), (14, 16)  # Legs
         ]
 
+        overlay = np.zeros_like(image, dtype=np.uint8)
+
+        def get_point_and_conf(kp):
+            if len(kp) == 4 and (kp[0] != 0 or kp[1] != 0):
+                return (int(kp[0]), int(kp[1])), kp[3]  # x, y, z, conf
+            elif len(kp) == 3 and (kp[0] != 0 or kp[1] != 0):
+                return (int(kp[0]), int(kp[1])), kp[2]  # x, y, conf
+            return None, 0.0
+
         line_thickness = 3 if is_lead_or_follow else 1
 
         for connection in connections:
-            start_point = tuple(map(int, pose[connection[0]][:2]))
-            end_point = tuple(map(int, pose[connection[1]][:2]))
-            cv2.line(image, start_point, end_point, color, line_thickness)
+            if len(pose) > max(connection):
+                start_point, start_conf = get_point_and_conf(pose[connection[0]])
+                end_point, end_conf = get_point_and_conf(pose[connection[1]])
+
+                if start_point is not None and end_point is not None:
+                    avg_conf = (start_conf + end_conf) / 2
+                    color_with_alpha = tuple(int(c * avg_conf) for c in color)
+                    cv2.line(overlay, start_point, end_point, color_with_alpha, line_thickness)
 
         for point in pose:
-            pt = tuple(map(int, point[:2]))
-            cv2.circle(image, pt, 3, color, -1)
+            pt, conf = get_point_and_conf(point)
+            if pt is not None:
+                color_with_alpha = tuple(int(c * conf) for c in color)
+                cv2.circle(overlay, pt, 3, color_with_alpha, -1)
+
+        cv2.add(image, overlay, image)
 
     def numpy_to_python(self, obj):
         if isinstance(obj, np.integer):

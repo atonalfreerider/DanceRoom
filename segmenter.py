@@ -84,6 +84,11 @@ class Segmenter:
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+            # Apply 5% expansion factor
+            expansion_kernel_size = int(min(frame_width, frame_height) * 0.05)
+            expansion_kernel = np.ones((expansion_kernel_size, expansion_kernel_size), np.uint8)
+            mask = cv2.dilate(mask, expansion_kernel, iterations=1)
+
             # Apply the mask to the frame
             masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
 
