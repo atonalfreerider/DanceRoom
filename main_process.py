@@ -1,26 +1,28 @@
 import os
 import argparse
-from person_segmentation import PersonSegmentation
-from room_tracker import detect_lines_and_axes
+
+import yolo_pose
+from segmenter import Segmenter
+import room_tracker
+from dancer_tracker import DancerTracker
+
 
 def main(input_video, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
+    segmenter = Segmenter(input_video, output_dir)
+    segmenter.process_video()
+
+    yoloPose = yolo_pose.YOLOPose(output_dir + "/figure-masks", output_dir + "/detections.json")
+    yoloPose.detect_poses()
+
+    room_tracker.room_tracker(input_video, output_dir)
+    room_tracker.debug_video(input_video, output_dir, output_dir + "/deltas.json")
+
     # Step 1: Segment people, create background-only video, and save masks and poses
-    segmenter = PersonSegmentation(output_dir)
-    if not segmenter.process_video(input_video):
-        print("Error processing video. Exiting.")
-        return
+    dancer_tracker = DancerTracker(input_video, output_dir)
+    dancer_tracker.process_video()
 
-    bg_video_path = segmenter.get_bg_video_path()
-
-    # Step 2: Process background-only video for room orientation and render poses
-    final_output_path = os.path.join(output_dir, 'final_output.mp4')
-    if os.path.exists(bg_video_path):
-        detect_lines_and_axes(bg_video_path, final_output_path)
-        print(f"Processing complete. Final output saved to: {final_output_path}")
-    else:
-        print(f"Error: Background video not found at {bg_video_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process video for person segmentation and room orientation.")

@@ -24,3 +24,6 @@ Useful Rules
 4 - the closer to the bottom of the image, the higher probability of the floor
 5 - the closer to the top of the image, the higher probability of the ceiling
 6 - the camera is likely at chest level
+
+
+https://universe.roboflow.com/timfowe/man-woman-detection
