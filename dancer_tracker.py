@@ -78,14 +78,6 @@ class DancerTracker:
         print(f"Saved men-women detections for {frame_count} frames.")
 
     def track_lead_and_follow(self):
-        cap = cv2.VideoCapture(self.input_path)
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-
-        tracker = BYTETracker(BYTETrackerArgs())
-        tracked_sequences = {}
-
         frame_count = len(os.listdir(self.figure_mask_dir))
         pbar = tqdm.tqdm(total=frame_count, desc="tracking poses")
 
@@ -120,88 +112,13 @@ class DancerTracker:
 
                 detection['gender'] = {'gender': gender, 'confidence': confidence}
 
-            detections_in_frame_torch = torch.tensor(
-                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], d['confidence']] for d in detections_in_frame],
-                dtype=torch.float32)
-
-            if len(detections_in_frame_torch) > 0:
-                img_info = [frame_height, frame_width]
-                img_size = [frame_height, frame_width]
-                online_targets = tracker.update(detections_in_frame_torch, img_info, img_size)
-
-                # Create a dictionary to store the best pose for each track
-                best_poses = {}
-
-                for t in online_targets:
-                    track_id = t.track_id
-                    tlwh = t.tlwh
-                    center_x, center_y = (tlwh[0] + tlwh[2]) / 2, (tlwh[1] + tlwh[3]) / 2
-
-                    # Find the closest pose for this track
-                    closest_pose = min(detections_in_frame,
-                                       key=lambda p: self.distance_to_center(p['bbox'], center_x, center_y))
-                    closest_distance = self.distance_to_center(closest_pose['bbox'], center_x, center_y)
-
-                    # Check if this pose is the best for this track
-                    if track_id not in best_poses or closest_distance < best_poses[track_id][1]:
-                        best_poses[track_id] = (closest_pose, closest_distance)
-
-                # Update tracked sequences with the best pose for each track
-                for track_id, (best_pose, _) in best_poses.items():
-                    if track_id not in tracked_sequences:
-                        tracked_sequences[track_id] = []
-                    tracked_sequences[track_id].append((frame_num, best_pose))
-
-            else:
-                print(f"No detections for frame {frame_num}")
             pbar.update(1)
 
         pbar.close()
 
-        # Vote on the gender of the tracked person based on the majority of highest confidence gender detections
-        for track_id, sequence in tracked_sequences.items():
-            gender_votes = {'male': 0, 'female': 0}
-            for _, pose in sequence:
-                gender_info = pose['gender']
-                if gender_info['gender'] in gender_votes:
-                    gender_votes[gender_info['gender']] += gender_info['confidence']
-
-            tracked_sequences[track_id] = {
-                'gender': max(gender_votes, key=gender_votes.get),
-                'sequence': sequence
-            }
-
         # Reduce the tracks down to only two people per frame (1 man and 1 woman)
         lead_track = None
         follow_track = None
-        max_male_length = 0
-        max_female_length = 0
-
-        for track_id, track_info in tracked_sequences.items():
-            if track_info['gender'] == 'male' and len(track_info['sequence']) > max_male_length:
-                lead_track = track_id
-                max_male_length = len(track_info['sequence'])
-            elif track_info['gender'] == 'female' and len(track_info['sequence']) > max_female_length:
-                follow_track = track_id
-                max_female_length = len(track_info['sequence'])
-
-        # Save the lead and follow tracks
-        lead_data = {}
-        follow_data = {}
-
-        if lead_track:
-            for frame_num, pose in tracked_sequences[lead_track]['sequence']:
-                lead_data[str(frame_num)] = pose['keypoints']
-
-        if follow_track:
-            for frame_num, pose in tracked_sequences[follow_track]['sequence']:
-                follow_data[str(frame_num)] = pose['keypoints']
-
-        self.save_json(lead_data, self.lead_file)
-        self.save_json(follow_data, self.follow_file)
-        self.save_json(tracked_sequences, os.path.join(self.output_dir, 'tracked_sequences.json'))
-
-        print(f"Saved lead and follow tracks. Lead frames: {len(lead_data)}, Follow frames: {len(follow_data)}")
 
     @staticmethod
     def distance_to_center(bbox, center_x, center_y):

@@ -27,44 +27,28 @@ class YOLOPose:
 
     def detect_poses(self):
         if self.detections:
-            last_frame = max(map(int, self.detections.keys())) if self.detections else -1
-            input_path = Path(self.input_path)
-
-            if input_path.is_file():
-                total_frames = int(cv2.VideoCapture(str(input_path)).get(cv2.CAP_PROP_FRAME_COUNT))
-            elif input_path.is_dir():
-                total_frames = len(list(input_path.glob('*.png')))
-            else:
-                raise ValueError("Input must be a video file or a directory containing PNG images.")
-
-            if last_frame + 1 >= total_frames:
-                print("All frames have been processed. Using cached pose detections.")
-                return
-            else:
-                print(f"Continuing from frame {last_frame + 1}")
-        else:
-            last_frame = -1
+            return
 
         model = YOLO('yolov8x-pose-p6.pt')
         input_path = Path(self.input_path)
 
         if input_path.is_file() and input_path.suffix.lower() in ['.mp4', '.avi', '.mov']:
-            self.process_video(model, input_path, last_frame + 1)
+            self.process_video(model, input_path)
         elif input_path.is_dir():
-            self.process_image_directory(model, input_path, last_frame + 1)
+            self.process_image_directory(model, input_path)
         else:
             raise ValueError("Input must be a video file or a directory containing PNG images.")
 
         self.save_json(self.detections, self.detections_file)
         print(f"Saved pose detections for {len(self.detections)} frames/images.")
 
-    def process_video(self, model, video_path, start_frame):
+    def process_video(self, model, video_path):
         cap = cv2.VideoCapture(str(video_path))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frame_count = start_frame
+
+        frame_count = 0
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        pb = tqdm.tqdm(total=total_frames, initial=start_frame, desc="Processing video frames")
+        pb = tqdm.tqdm(total=total_frames, desc="Processing video frames")
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -75,38 +59,35 @@ class YOLOPose:
             frame_count += 1
             pb.update(1)
 
-            if frame_count % self.save_interval == 0:
-                self.save_json(self.detections, self.detections_file)
-
         cap.release()
         pb.close()
 
-    def process_image_directory(self, model, dir_path, start_frame):
+    def process_image_directory(self, model, dir_path):
         image_files = sorted([f for f in dir_path.glob('*.png')])
         total_images = len(image_files)
 
-        pbar = tqdm.tqdm(total=total_images, initial=start_frame, desc="Processing images")
-        for idx, img_path in enumerate(image_files[start_frame:], start=start_frame):
-            frame = cv2.imread(str(img_path))
-            self.process_frame(model, frame, idx)
+        pbar = tqdm.tqdm(total=total_images, desc="Processing images")
+        for i, image_file in enumerate(image_files):
+            frame = cv2.imread(str(image_file))
+            self.process_frame(model, frame, i)
             pbar.update(1)
-
-            if (idx + 1) % self.save_interval == 0:
-                self.save_json(self.detections, self.detections_file)
 
         pbar.close()
 
     def process_frame(self, model, frame, frame_index):
-        results = model(frame)
+        results = model.track(frame, stream=True, persist=True)
+
         frame_detections = []
 
         for r in results:
+            ids = r.boxes.id.cpu().numpy()
             boxes = r.boxes.xyxy.cpu().numpy()
             confs = r.boxes.conf.cpu().numpy()
             keypoints = r.keypoints.data.cpu().numpy()
 
-            for box, conf, kps in zip(boxes, confs, keypoints):
+            for track_id, box, conf, kps in zip(ids, boxes, confs, keypoints):
                 detection = {
+                    "id": int(track_id),
                     "bbox": box.tolist(),
                     "confidence": float(conf),
                     "keypoints": kps.tolist()
