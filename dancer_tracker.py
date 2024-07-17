@@ -124,7 +124,7 @@ class DancerTracker:
                     detection['gender'] = {'gender': 'unknown', 'confidence': 0}
 
             detections_in_frame_torch = torch.tensor(
-                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], 1.0] for d in detections_in_frame],
+                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], d['confidence']] for d in detections_in_frame],
                 dtype=torch.float32)
 
             if len(detections_in_frame_torch) > 0:
