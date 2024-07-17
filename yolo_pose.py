@@ -80,7 +80,10 @@ class YOLOPose:
         frame_detections = []
 
         for r in results:
-            ids = r.boxes.id.cpu().numpy()
+            if r.boxes.id is None:
+                ids = []
+            else:
+                ids = r.boxes.id.cpu().numpy()
             boxes = r.boxes.xyxy.cpu().numpy()
             confs = r.boxes.conf.cpu().numpy()
             keypoints = r.keypoints.data.cpu().numpy()
