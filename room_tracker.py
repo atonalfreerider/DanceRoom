@@ -245,7 +245,7 @@ def point_in_box(point, box):
 
 
 def filter_static_points(points, old_points, threshold=0.1):
-    if old_points is None or len(points) != len(old_points):
+    if old_points is None or len(points) != len(old_points) or len(points) == 0 or len(old_points) == 0:
         return points, old_points
 
     # Convert lists to numpy arrays if they're not already
