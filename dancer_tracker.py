@@ -91,37 +91,34 @@ class DancerTracker:
 
         for frame_num in range(frame_count):
             detections_in_frame = self.detections.get(str(frame_num), [])
-
             men_women_in_frame = self.men_women.get(frame_num, {'men': [], 'women': []})
+
             for detection in detections_in_frame:
                 bbox = detection.get('bbox', [])
-                if bbox:
-                    x, y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2  # Center of the bbox
+                x, y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2  # Center of the bbox
 
-                    # Match the box to the closest gender bbox and assign the gender and confidence
-                    min_distance = float('inf')
-                    gender = 'unknown'
-                    confidence = 0
+                # Match the box to the closest gender bbox and assign the gender and confidence
+                min_distance = float('inf')
+                gender = 'unknown'
+                confidence = 0
 
-                    for man in men_women_in_frame['men']:
-                        man_center_x, man_center_y = (man[0] + man[2]) / 2, (man[1] + man[3]) / 2
-                        distance = ((x - man_center_x) ** 2 + (y - man_center_y) ** 2) ** 0.5
-                        if distance < min_distance:
-                            min_distance = distance
-                            gender = 'male'
-                            confidence = man[4]
+                for man in men_women_in_frame['men']:
+                    man_center_x, man_center_y = (man[0] + man[2]) / 2, (man[1] + man[3]) / 2
+                    distance = ((x - man_center_x) ** 2 + (y - man_center_y) ** 2) ** 0.5
+                    if distance < min_distance:
+                        min_distance = distance
+                        gender = 'male'
+                        confidence = man[4]
 
-                    for woman in men_women_in_frame['women']:
-                        woman_center_x, woman_center_y = (woman[0] + woman[2]) / 2, (woman[1] + woman[3]) / 2
-                        distance = ((x - woman_center_x) ** 2 + (y - woman_center_y) ** 2) ** 0.5
-                        if distance < min_distance:
-                            min_distance = distance
-                            gender = 'female'
-                            confidence = woman[4]
+                for woman in men_women_in_frame['women']:
+                    woman_center_x, woman_center_y = (woman[0] + woman[2]) / 2, (woman[1] + woman[3]) / 2
+                    distance = ((x - woman_center_x) ** 2 + (y - woman_center_y) ** 2) ** 0.5
+                    if distance < min_distance:
+                        min_distance = distance
+                        gender = 'female'
+                        confidence = woman[4]
 
-                    detection['gender'] = {'gender': gender, 'confidence': confidence}
-                else:
-                    detection['gender'] = {'gender': 'unknown', 'confidence': 0}
+                detection['gender'] = {'gender': gender, 'confidence': confidence}
 
             detections_in_frame_torch = torch.tensor(
                 [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], d['confidence']] for d in detections_in_frame],
@@ -138,12 +135,12 @@ class DancerTracker:
                 for t in online_targets:
                     track_id = t.track_id
                     tlwh = t.tlwh
-                    center_x, center_y = tlwh[0] + tlwh[2] / 2, tlwh[1] + tlwh[3] / 2
+                    center_x, center_y = (tlwh[0] + tlwh[2]) / 2, (tlwh[1] + tlwh[3]) / 2
 
                     # Find the closest pose for this track
                     closest_pose = min(detections_in_frame,
-                                       key=lambda p: self.distance_to_center(p['keypoints'], center_x, center_y))
-                    closest_distance = self.distance_to_center(closest_pose['keypoints'], center_x, center_y)
+                                       key=lambda p: self.distance_to_center(p['bbox'], center_x, center_y))
+                    closest_distance = self.distance_to_center(closest_pose['bbox'], center_x, center_y)
 
                     # Check if this pose is the best for this track
                     if track_id not in best_poses or closest_distance < best_poses[track_id][1]:
@@ -207,12 +204,9 @@ class DancerTracker:
         print(f"Saved lead and follow tracks. Lead frames: {len(lead_data)}, Follow frames: {len(follow_data)}")
 
     @staticmethod
-    def distance_to_center(keypoints, center_x, center_y):
-        valid_points = [p[:2] for p in keypoints if p[2] > 0]
-        if not valid_points:
-            return float('inf')
-        pose_center_x = sum(p[0] for p in valid_points) / len(valid_points)
-        pose_center_y = sum(p[1] for p in valid_points) / len(valid_points)
+    def distance_to_center(bbox, center_x, center_y):
+        pose_center_x = (bbox[0] + bbox[2]) / 2
+        pose_center_y = (bbox[1] + bbox[3]) / 2
         return ((pose_center_x - center_x) ** 2 + (pose_center_y - center_y) ** 2) ** 0.5
 
     #region UTILITY
