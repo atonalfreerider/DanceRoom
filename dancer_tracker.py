@@ -3,18 +3,7 @@ import numpy as np
 from ultralytics import YOLO
 import json
 import os
-from yolox.tracker.byte_tracker import BYTETracker
-import torch
 import tqdm
-
-
-class BYTETrackerArgs:
-    track_thresh: float = 0.25
-    track_buffer: int = 30
-    match_thresh: float = 0.8
-    aspect_ratio_thresh: float = 3.0
-    min_box_area: float = 1.0
-    mot20: bool = False
 
 
 class DancerTracker:
@@ -78,20 +67,12 @@ class DancerTracker:
         print(f"Saved men-women detections for {frame_count} frames.")
 
     def track_lead_and_follow(self):
-        cap = cv2.VideoCapture(self.input_path)
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-
-        tracker = BYTETracker(BYTETrackerArgs())
-        tracked_sequences = {}
-
         frame_count = len(os.listdir(self.figure_mask_dir))
         pbar = tqdm.tqdm(total=frame_count, desc="tracking poses")
 
         for frame_num in range(frame_count):
             detections_in_frame = self.detections.get(str(frame_num), [])
-            men_women_in_frame = self.men_women.get(frame_num, {'men': [], 'women': []})
+            men_women_in_frame = self.men_women.get(str(frame_num), {'men': [], 'women': []})
 
             for detection in detections_in_frame:
                 bbox = detection.get('bbox', [])
@@ -120,88 +101,13 @@ class DancerTracker:
 
                 detection['gender'] = {'gender': gender, 'confidence': confidence}
 
-            detections_in_frame_torch = torch.tensor(
-                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], d['confidence']] for d in detections_in_frame],
-                dtype=torch.float32)
-
-            if len(detections_in_frame_torch) > 0:
-                img_info = [frame_height, frame_width]
-                img_size = [frame_height, frame_width]
-                online_targets = tracker.update(detections_in_frame_torch, img_info, img_size)
-
-                # Create a dictionary to store the best pose for each track
-                best_poses = {}
-
-                for t in online_targets:
-                    track_id = t.track_id
-                    tlwh = t.tlwh
-                    center_x, center_y = (tlwh[0] + tlwh[2]) / 2, (tlwh[1] + tlwh[3]) / 2
-
-                    # Find the closest pose for this track
-                    closest_pose = min(detections_in_frame,
-                                       key=lambda p: self.distance_to_center(p['bbox'], center_x, center_y))
-                    closest_distance = self.distance_to_center(closest_pose['bbox'], center_x, center_y)
-
-                    # Check if this pose is the best for this track
-                    if track_id not in best_poses or closest_distance < best_poses[track_id][1]:
-                        best_poses[track_id] = (closest_pose, closest_distance)
-
-                # Update tracked sequences with the best pose for each track
-                for track_id, (best_pose, _) in best_poses.items():
-                    if track_id not in tracked_sequences:
-                        tracked_sequences[track_id] = []
-                    tracked_sequences[track_id].append((frame_num, best_pose))
-
-            else:
-                print(f"No detections for frame {frame_num}")
             pbar.update(1)
 
         pbar.close()
 
-        # Vote on the gender of the tracked person based on the majority of highest confidence gender detections
-        for track_id, sequence in tracked_sequences.items():
-            gender_votes = {'male': 0, 'female': 0}
-            for _, pose in sequence:
-                gender_info = pose['gender']
-                if gender_info['gender'] in gender_votes:
-                    gender_votes[gender_info['gender']] += gender_info['confidence']
-
-            tracked_sequences[track_id] = {
-                'gender': max(gender_votes, key=gender_votes.get),
-                'sequence': sequence
-            }
-
         # Reduce the tracks down to only two people per frame (1 man and 1 woman)
         lead_track = None
         follow_track = None
-        max_male_length = 0
-        max_female_length = 0
-
-        for track_id, track_info in tracked_sequences.items():
-            if track_info['gender'] == 'male' and len(track_info['sequence']) > max_male_length:
-                lead_track = track_id
-                max_male_length = len(track_info['sequence'])
-            elif track_info['gender'] == 'female' and len(track_info['sequence']) > max_female_length:
-                follow_track = track_id
-                max_female_length = len(track_info['sequence'])
-
-        # Save the lead and follow tracks
-        lead_data = {}
-        follow_data = {}
-
-        if lead_track:
-            for frame_num, pose in tracked_sequences[lead_track]['sequence']:
-                lead_data[str(frame_num)] = pose['keypoints']
-
-        if follow_track:
-            for frame_num, pose in tracked_sequences[follow_track]['sequence']:
-                follow_data[str(frame_num)] = pose['keypoints']
-
-        self.save_json(lead_data, self.lead_file)
-        self.save_json(follow_data, self.follow_file)
-        self.save_json(tracked_sequences, os.path.join(self.output_dir, 'tracked_sequences.json'))
-
-        print(f"Saved lead and follow tracks. Lead frames: {len(lead_data)}, Follow frames: {len(follow_data)}")
 
     @staticmethod
     def distance_to_center(bbox, center_x, center_y):
@@ -239,30 +145,40 @@ class DancerTracker:
         out = cv2.VideoWriter(debug_video_path, fourcc, fps, (frame_width, frame_height))
 
         # Load tracked sequences
-        tracked_sequences = self.load_json(os.path.join(self.output_dir, 'tracked_sequences.json'))
         lead_track = self.load_json(self.lead_file)
         follow_track = self.load_json(self.follow_file)
 
-        frame_count = 0
-        while cap.isOpened():
+        # Restructure detections for efficient access
+        detections_by_frame = {int(frame_id): detections for frame_id, detections in self.detections.items()}
+
+        for frame_count in range(total_frames):
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Draw all tracked poses
-            for track_id, track_info in tracked_sequences.items():
-                pose = next((p for f, p in track_info['sequence'] if f == frame_count), None)
-                if pose:
-                    color = (255, 0, 255) if track_info['gender'] == 'female' else (255, 0, 0)
-                    self.draw_pose(frame, pose['keypoints'], color)
+            # Draw all tracked poses for the current frame
+            detections_in_frame = detections_by_frame.get(frame_count, [])
+            for detection in detections_in_frame:
+                pose = detection.get('keypoints')
+                gender = detection.get('gender')
+                track_id = detection.get('id')
+                bbox = detection.get('bbox')
 
-                    # Draw bounding box
-                    x1, y1, x2, y2 = pose['bbox']
+                if pose:
+                    color = (125, 125, 125)
+                    if gender['gender'] == 'female':
+                        color = (100, 100, 255)
+                    elif gender['gender'] == 'male':
+                        color = (255, 0, 0)
+                    self.draw_pose(frame, pose, color)
+
+                    x1, y1, x2, y2 = bbox
                     cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
 
                     # Put track ID text
-                    cv2.putText(frame, f"ID: {track_id}", (int(x1), int(y1) - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    if track_id is not None:
+                        cv2.putText(frame, f"ID: {track_id}", (int(x1), int(y1) - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # Draw lead and follow
             lead_pose = lead_track.get(str(frame_count))
@@ -279,17 +195,11 @@ class DancerTracker:
 
             out.write(frame)
 
-            frame_count += 1
             if frame_count % 100 == 0:
                 print(f"Processed {frame_count}/{total_frames} frames for debug video")
 
         cap.release()
         out.release()
-
-        if frame_count == 0:
-            print("Error: No frames were processed. Check your input video and depth maps.")
-        else:
-            print(f"Debug video saved to {debug_video_path} with {frame_count} frames")
 
     @staticmethod
     def draw_pose(image, pose, color, is_lead_or_follow=False):
