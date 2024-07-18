@@ -34,7 +34,7 @@ class DancerTracker:
             print("Using cached men-women detections.")
             return
 
-        model = YOLO('yolov8x-man-woman.pt')
+        model = YOLO('yolov9e-man-woman.pt')
 
         frame_count = len(os.listdir(self.figure_mask_dir))
         pbar = tqdm.tqdm(total=frame_count, desc="Detecting men and women")
