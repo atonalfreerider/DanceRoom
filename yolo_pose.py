@@ -29,7 +29,7 @@ class YOLOPose:
         if self.detections:
             return
 
-        model = YOLO('yolov8x-pose-p6.pt', task='pose')
+        model = YOLO('yolo11x-pose.pt', task='pose')
         input_path = Path(self.input_path)
 
         if input_path.is_file() and input_path.suffix.lower() in ['.mp4', '.avi', '.mov']:

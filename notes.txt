@@ -1,22 +1,16 @@
-conda create -n DanceRoom python=3.10
+conda create -y -n DanceRoom python=3.10
 conda config --add channels conda-forge
 conda install -c conda-forge opencv cudatoolkit scikit-learn scipy filterpy ultralytics segment-anything
 
-//conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.8 -c pytorch -c nvidia
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu118
-pip install ultralytics-thop
-
-conda install pytorch pytorch-cuda=11.8 -c pytorch -c nvidia
-pip install torchvision --extra-index-url https://download.pytorch.org/whl/cu118
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
+pip install -U torch torchvision
 
 Download models:
 https://github.com/THU-MIG/yolov10/releases
-https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8x-pose-p6.pt
+https://docs.ultralytics.com/tasks/pose/#models
 https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
 
 
-
-ond
 Useful Rules
 1 - The ratio of pose limbs never changes
 2 - feet can't go through the floor, and one foot is always on the floor
