@@ -68,14 +68,20 @@ class DancerTracker:
 
     def track_lead_and_follow(self):
         frame_count = len(os.listdir(self.figure_mask_dir))
-        pbar = tqdm.tqdm(total=frame_count, desc="tracking poses")
+        pbar = tqdm.tqdm(total=frame_count, desc="Tracking poses")
 
+        track_gender_votes = {}
+        lead_track_ids = set()
+        follow_track_ids = set()
+
+        # First pass: Assign genders and collect votes
         for frame_num in range(frame_count):
             detections_in_frame = self.detections.get(str(frame_num), [])
             men_women_in_frame = self.men_women.get(str(frame_num), {'men': [], 'women': []})
 
             for detection in detections_in_frame:
                 bbox = detection.get('bbox', [])
+                track_id = detection.get('id')
                 x, y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2  # Center of the bbox
 
                 # Match the box to the closest gender bbox and assign the gender and confidence
@@ -101,13 +107,47 @@ class DancerTracker:
 
                 detection['gender'] = {'gender': gender, 'confidence': confidence}
 
+                # Collect votes for track gender
+                if track_id not in track_gender_votes:
+                    track_gender_votes[track_id] = {'male': 0, 'female': 0, 'unknown': 0}
+                track_gender_votes[track_id][gender] += confidence
+
             pbar.update(1)
 
         pbar.close()
 
-        # Reduce the tracks down to only two people per frame (1 man and 1 woman)
-        lead_track = None
-        follow_track = None
+        # Determine final gender for each track
+        for track_id, votes in track_gender_votes.items():
+            if votes['male'] > votes['female'] and votes['male'] > votes['unknown']:
+                lead_track_ids.add(track_id)
+            elif votes['female'] > votes['male'] and votes['female'] > votes['unknown']:
+                follow_track_ids.add(track_id)
+            # If 'unknown' has the highest vote, we don't assign it to either lead or follow
+
+        # Second pass: Select lead and follow poses
+        lead_poses = {}
+        follow_poses = {}
+
+        for frame_num in range(frame_count):
+            detections_in_frame = self.detections.get(str(frame_num), [])
+            
+            lead_candidates = [d for d in detections_in_frame if d.get('id') in lead_track_ids]
+            follow_candidates = [d for d in detections_in_frame if d.get('id') in follow_track_ids]
+
+            # Select the most confident lead and follow poses
+            if lead_candidates:
+                lead_pose = max(lead_candidates, key=lambda x: x['gender']['confidence'])
+                lead_poses[frame_num] = lead_pose['keypoints']
+
+            if follow_candidates:
+                follow_pose = max(follow_candidates, key=lambda x: x['gender']['confidence'])
+                follow_poses[frame_num] = follow_pose['keypoints']
+
+        # Save the results
+        self.save_json(lead_poses, self.lead_file)
+        self.save_json(follow_poses, self.follow_file)
+
+        print(f"Tracked lead and follow poses for {frame_count} frames.")
 
     @staticmethod
     def distance_to_center(bbox, center_x, center_y):
@@ -253,3 +293,4 @@ class DancerTracker:
             return obj
 
     #endregion
+
