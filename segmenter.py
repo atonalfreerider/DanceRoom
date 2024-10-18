@@ -5,6 +5,7 @@ from tqdm import tqdm
 from scipy.signal import savgol_filter
 
 
+# uses depth maps to isolate figures dancing in center of floor
 class Segmenter:
     def __init__(self, video_path, output_dir):
         # Create output directories
