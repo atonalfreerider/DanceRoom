@@ -232,6 +232,11 @@ class ManualRoleAssignment:
         step = (end_idx - start_idx) / 9
         return [person_frames[int(end_idx - i * step)] for i in range(10)][::-1]
 
+    def reset_recursive_state(self):
+        self.recursive_depth = 0
+        self.recursive_samples = []
+        self.current_samples = self.sample_frames
+
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
             layout = self.calculate_optimal_layout(len(self.current_samples))
@@ -253,26 +258,16 @@ class ManualRoleAssignment:
 
             if self.recursive_depth == 0:
                 if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
-                    if self.recursive_depth >= self.max_recursive_depth or len(self.current_samples) == 2:
-                        self.split_point = self.current_samples[self.current_hover_index]
-                        self.assign_role(self.current_track_id, self.split_point)
-                        self.show_main_collage()
-                        if self.recursive_depth > 0:
-                            self.show_detailed_view()
-                        self.split_point = None
-                    else:
-                        end_frame = self.current_samples[self.current_hover_index]
-                        start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
-                        self.recursive_samples = self.get_recursive_samples(start_frame, end_frame)
-                        self.recursive_depth += 1
-                        self.current_samples = self.recursive_samples
-                        self.show_detailed_view()
+                    end_frame = self.current_samples[self.current_hover_index]
+                    start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
+                    self.recursive_samples = self.get_recursive_samples(start_frame, end_frame)
+                    self.recursive_depth += 1
+                    self.current_samples = self.recursive_samples
+                    self.show_detailed_view()
                 else:
-                    # Assign role to entire track if not hovering or at coarse resolution
-                    self.assign_role(self.current_track_id, self.current_samples[0])
+                    # Reset all roles for this track if clicked outside any sample at top level
+                    self.reset_all_roles()
                     self.show_main_collage()
-                    if self.recursive_depth > 0:
-                        self.show_detailed_view()
             else:
                 if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
                     end_frame = self.recursive_samples[self.current_hover_index]
@@ -297,6 +292,18 @@ class ManualRoleAssignment:
             cv2.resizeWindow("Detailed View", 1920, 1080)
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.mouse_callback)
+            
+            while True:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:  # ESC key or window closed
+                    cv2.destroyWindow("Detailed View")
+                    self.reset_recursive_state()
+                    self.show_main_collage()
+                    break
+                elif key == 82:  # Up arrow
+                    self.assign_role_with_hover('lead')
+                elif key == 84:  # Down arrow
+                    self.assign_role_with_hover('follow')
 
     def process_tracks(self):
         lead_file = self.output_dir / "lead.json"
@@ -332,7 +339,6 @@ class ManualRoleAssignment:
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
-                    cv2.destroyWindow("Detailed View")
                     break
 
         self.update_final_tracks()
@@ -381,8 +387,11 @@ class ManualRoleAssignment:
             elif frame_num < start_frame:
                 for detection in detections:
                     if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
-                        self.current_track_assignments[other_role][frame] = detection
-                        self.current_track_assignments[role].pop(frame, None)
+                        if frame not in self.current_track_assignments[role] and frame not in self.current_track_assignments[other_role]:
+                            self.current_track_assignments[other_role][frame] = detection
+
+    def reset_all_roles(self):
+        self.current_track_assignments = {'lead': {}, 'follow': {}}
 
     def update_final_tracks(self):
         for role in ['lead', 'follow']:
