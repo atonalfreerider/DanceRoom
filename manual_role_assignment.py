@@ -42,6 +42,11 @@ class ManualRoleAssignment:
         self.split_point = None
         self.is_hovering = False
 
+        self.processed_track_ids = set()  # Add this line
+        self.lead_file = self.output_dir / "lead.json"
+        self.follow_file = self.output_dir / "follow.json"
+        self.load_existing_assignments()
+
     @staticmethod
     def load_json(json_path):
         with open(json_path, 'r') as f:
@@ -296,11 +301,8 @@ class ManualRoleAssignment:
             cv2.setMouseCallback("Detailed View", self.mouse_callback)
 
     def process_tracks(self):
-        lead_file = self.output_dir / "lead.json"
-        follow_file = self.output_dir / "follow.json"
-        
-        if lead_file.exists() and follow_file.exists():
-            print("Lead and Follow JSON files already exist. Skipping manual assignment.")
+        if self.current_track_id is None:
+            print("All tracks have been processed. No manual assignment needed.")
             return
 
         while self.current_track_id is not None:
@@ -328,6 +330,7 @@ class ManualRoleAssignment:
                     self.assign_role_with_hover('follow')
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
+                    self.update_processed_track_ids()  # Add this line
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
                     cv2.destroyWindow("Detailed View")
                     break
@@ -341,7 +344,11 @@ class ManualRoleAssignment:
         cv2.destroyAllWindows()
 
     def reset_track_variables(self):
-        self.current_track_assignments = {'lead': {}, 'follow': {}}
+        # Only reset assignments for the current track
+        self.current_track_assignments = {
+            'lead': {k: v for k, v in self.current_track_assignments['lead'].items() if v['id'] == self.current_track_id},
+            'follow': {k: v for k, v in self.current_track_assignments['follow'].items() if v['id'] == self.current_track_id}
+        }
         self.split_point = None
         self.recursive_depth = 0
         self.recursive_samples = []
@@ -403,6 +410,49 @@ class ManualRoleAssignment:
                 else:
                     self.follow_tracks[frame] = [detection]
                     self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id]
+
+    def load_existing_assignments(self):
+        if self.lead_file.exists() and self.follow_file.exists():
+            with open(self.lead_file, 'r') as f:
+                self.lead_tracks = json.load(f)
+            with open(self.follow_file, 'r') as f:
+                self.follow_tracks = json.load(f)
+
+            last_assigned_id = -1
+            # Assign roles from existing files to detections
+            for role in ['lead', 'follow']:
+                for frame, detections in getattr(self, f'{role}_tracks').items():
+                    for detection in detections:
+                        track_id = detection['id']
+                        self.current_track_assignments[role][frame] = detection
+                        self.processed_track_ids.add(track_id)
+                        last_assigned_id = max(last_assigned_id, track_id)
+
+            # Set the current_track_id to the first unassigned track after the last assigned one
+            all_track_ids = self.find_all_track_ids()
+            for track_id in all_track_ids:
+                if track_id > last_assigned_id and track_id not in self.processed_track_ids:
+                    self.current_track_id = track_id
+                    break
+            else:
+                self.current_track_id = None  # All tracks have been processed
+
+        else:
+            self.current_track_id = self.find_first_track_id()
+
+    def find_all_track_ids(self):
+        all_track_ids = set()
+        for detections in self.detections.values():
+            for detection in detections:
+                if self.is_valid_detection(detection):
+                    all_track_ids.add(detection['id'])
+        return sorted(list(all_track_ids))
+
+    def update_processed_track_ids(self):
+        for role in ['lead', 'follow']:
+            for frame, detections in getattr(self, f'{role}_tracks').items():
+                for detection in detections:
+                    self.processed_track_ids.add(detection['id'])
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
