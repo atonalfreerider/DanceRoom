@@ -21,12 +21,8 @@ class ManualRoleAssignment:
         cv2.resizeWindow(self.window_name, 1920, 1080)
         self.screen_width = 1920
         self.screen_height = 1080
-        self.num_columns = 6
-        self.num_rows = 4
-        self.num_samples = self.num_columns * self.num_rows
+        self.num_samples = 24  # Adjust this number as needed
         self.aspect_ratio = self.frame_height / int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.crop_size = self.calculate_crop_size()
-        self.detailed_crop_size = (int(self.crop_size[0] * 0.75), int(self.crop_size[1] * 0.75))
         self.button_height = 40
         self.button_width = 150
         self.button_color = (200, 200, 200)  # Light gray
@@ -135,17 +131,37 @@ class ManualRoleAssignment:
             if pt:
                 cv2.circle(image, pt, 5, color, -1)
 
-    def calculate_crop_size(self):
-        width = self.screen_width // self.num_columns
-        height = int(width * self.aspect_ratio)
-        if height * self.num_rows > self.screen_height:
-            height = self.screen_height // self.num_rows
-            width = int(height / self.aspect_ratio)
-        return (width, height)
+    def calculate_optimal_layout(self, num_images):
+        aspect_ratio = self.aspect_ratio
+        screen_aspect = self.screen_width / self.screen_height
+        
+        # Calculate the number of rows and columns
+        num_cols = int(np.ceil(np.sqrt(num_images * screen_aspect / aspect_ratio)))
+        num_rows = int(np.ceil(num_images / num_cols))
+        
+        # Calculate image size
+        img_width = self.screen_width // num_cols
+        img_height = self.screen_height // num_rows
+        
+        # Adjust image size to maintain aspect ratio
+        if img_width / img_height > aspect_ratio:
+            img_width = int(img_height * aspect_ratio)
+        else:
+            img_height = int(img_width / aspect_ratio)
+        
+        # Calculate layout
+        layout = []
+        for i in range(num_images):
+            row = i // num_cols
+            col = i % num_cols
+            x = col * (self.screen_width // num_cols) + (self.screen_width // num_cols - img_width) // 2
+            y = row * (self.screen_height // num_rows) + (self.screen_height // num_rows - img_height) // 2
+            layout.append((x, y, img_width, img_height))
+        
+        return layout
 
     def create_collage(self, track_id, sample_frames, is_detailed=False):
         crops = []
-        crop_size = self.detailed_crop_size if is_detailed else self.crop_size
         for frame_idx in sample_frames:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = self.cap.read()
@@ -159,31 +175,18 @@ class ManualRoleAssignment:
             bbox = person['bbox']
             x1, y1, x2, y2 = map(int, bbox)
             crop = frame[y1:y2, x1:x2]
-            
-            # Calculate the aspect ratio of the crop
-            crop_aspect = crop.shape[1] / crop.shape[0]
-            
-            # Calculate the target size maintaining the aspect ratio
-            if crop_aspect > crop_size[0] / crop_size[1]:
-                target_width = crop_size[0]
-                target_height = int(target_width / crop_aspect)
-            else:
-                target_height = crop_size[1]
-                target_width = int(target_height * crop_aspect)
-            
-            # Resize the crop
-            crop_resized = cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
-            
-            # Create a black background of the desired size
-            background = np.zeros((crop_size[1], crop_size[0], 3), dtype=np.uint8)
-            
-            # Calculate the position to paste the resized crop
-            y_offset = (crop_size[1] - target_height) // 2
-            x_offset = (crop_size[0] - target_width) // 2
-            
-            # Paste the resized crop onto the background
-            background[y_offset:y_offset+target_height, x_offset:x_offset+target_width] = crop_resized
+            crops.append((crop, frame_idx, person))
 
+        if not crops:
+            return None
+
+        # Calculate the optimal layout
+        layout = self.calculate_optimal_layout(len(crops))
+        collage = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
+
+        for (crop, frame_idx, person), (x, y, w, h) in zip(crops, layout):
+            crop_resized = cv2.resize(crop, (w, h), interpolation=cv2.INTER_AREA)
+            
             # Determine the color based on the current track assignments
             if str(frame_idx) in self.current_track_assignments['lead']:
                 color = self.lead_color
@@ -194,36 +197,22 @@ class ManualRoleAssignment:
 
             # Draw the pose on the resized crop
             keypoints = person['keypoints']
+            bbox = person['bbox']
             adjusted_keypoints = [
-                [kp[0] - x1, kp[1] - y1] + kp[2:] for kp in keypoints
+                [kp[0] - bbox[0], kp[1] - bbox[1]] + kp[2:] for kp in keypoints
             ]
-            scale_x = target_width / (x2 - x1)
-            scale_y = target_height / (y2 - y1)
+            scale_x = w / (bbox[2] - bbox[0])
+            scale_y = h / (bbox[3] - bbox[1])
             scaled_keypoints = [
-                [kp[0] * scale_x + x_offset, kp[1] * scale_y + y_offset] + kp[2:] for kp in adjusted_keypoints
+                [kp[0] * scale_x, kp[1] * scale_y] + kp[2:] for kp in adjusted_keypoints
             ]
-            self.draw_pose(background, scaled_keypoints, color)
+            self.draw_pose(crop_resized, scaled_keypoints, color)
             
-            crops.append(background)
-
-        if not crops:
-            return None
-
-        # Create the collage
-        rows = self.num_rows
-        cols = self.num_columns
-        collage = np.zeros((rows * crop_size[1], cols * crop_size[0], 3), dtype=np.uint8)
-
-        for i, crop in enumerate(crops):
-            if i >= self.num_samples:
-                break
-            row = i // cols
-            col = i % cols
-            collage[row*crop_size[1]:(row+1)*crop_size[1], col*crop_size[0]:(col+1)*crop_size[0]] = crop
+            collage[y:y+h, x:x+w] = crop_resized
 
         # Draw the "Save to JSON" button
-        button_top = collage.shape[0] - self.button_height - 10
-        button_left = collage.shape[1] - self.button_width - 10
+        button_top = self.screen_height - self.button_height - 10
+        button_left = self.screen_width - self.button_width - 10
         cv2.rectangle(collage, (button_left, button_top), 
                       (button_left + self.button_width, button_top + self.button_height), 
                       self.button_color, -1)
@@ -241,19 +230,19 @@ class ManualRoleAssignment:
             return [start_frame, end_frame]
         
         step = (end_idx - start_idx) / 9
-        return [person_frames[int(start_idx + i * step)] for i in range(10)]
+        return [person_frames[int(end_idx - i * step)] for i in range(10)][::-1]
 
     def mouse_callback(self, event, x, y, flags, param):
-        row = y // self.crop_size[1]
-        col = x // self.crop_size[0]
-        index = row * self.num_columns + col
-
         if event == cv2.EVENT_MOUSEMOVE:
-            if index < self.num_samples:
-                self.current_hover_index = index
-                self.is_hovering = True
-            else:
-                self.is_hovering = False
+            layout = self.calculate_optimal_layout(len(self.current_samples))
+            for i, (lx, ly, lw, lh) in enumerate(layout):
+                if lx <= x < lx + lw and ly <= y < ly + lh:
+                    self.current_hover_index = i
+                    self.is_hovering = True
+                    return
+            self.is_hovering = False
+            self.current_hover_index = None
+
         elif event == cv2.EVENT_LBUTTONDOWN:
             # Check if the click is on the "Save to JSON" button
             button_top = self.screen_height - self.button_height - 10
@@ -262,31 +251,44 @@ class ManualRoleAssignment:
                 self.save_json_files()
                 return
 
-            if index < self.num_samples:
-                if self.recursive_depth == 0:
-                    if index > 0:
-                        start_frame = self.sample_frames[index - 1]
-                        end_frame = self.sample_frames[index]
+            if self.recursive_depth == 0:
+                if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+                    if self.recursive_depth >= self.max_recursive_depth or len(self.current_samples) == 2:
+                        self.split_point = self.current_samples[self.current_hover_index]
+                        self.assign_role(self.current_track_id, self.split_point)
+                        self.show_main_collage()
+                        if self.recursive_depth > 0:
+                            self.show_detailed_view()
+                        self.split_point = None
+                    else:
+                        end_frame = self.current_samples[self.current_hover_index]
+                        start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
                         self.recursive_samples = self.get_recursive_samples(start_frame, end_frame)
                         self.recursive_depth += 1
                         self.current_samples = self.recursive_samples
                         self.show_detailed_view()
                 else:
-                    if index > 0:
-                        start_frame = self.recursive_samples[index - 1]
-                        end_frame = self.recursive_samples[index]
-                        new_samples = self.get_recursive_samples(start_frame, end_frame)
-                        
-                        if len(new_samples) == 2 or self.recursive_depth >= self.max_recursive_depth:
-                            # We've reached the finest resolution or max depth
-                            self.recursive_samples = new_samples
-                            self.current_samples = self.recursive_samples
-                            self.show_detailed_view()
-                        else:
-                            self.recursive_samples = new_samples
-                            self.current_samples = self.recursive_samples
-                            self.recursive_depth += 1
-                            self.show_detailed_view()
+                    # Assign role to entire track if not hovering or at coarse resolution
+                    self.assign_role(self.current_track_id, self.current_samples[0])
+                    self.show_main_collage()
+                    if self.recursive_depth > 0:
+                        self.show_detailed_view()
+            else:
+                if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+                    end_frame = self.recursive_samples[self.current_hover_index]
+                    start_frame = self.recursive_samples[max(0, self.current_hover_index - 1)]
+                    new_samples = self.get_recursive_samples(start_frame, end_frame)
+                    
+                    if len(new_samples) == 2 or self.recursive_depth >= self.max_recursive_depth:
+                        # We've reached the finest resolution or max depth
+                        self.recursive_samples = new_samples
+                        self.current_samples = self.recursive_samples
+                        self.show_detailed_view()
+                    else:
+                        self.recursive_samples = new_samples
+                        self.current_samples = self.recursive_samples
+                        self.recursive_depth += 1
+                        self.show_detailed_view()
 
     def show_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples, is_detailed=True)
