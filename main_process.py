@@ -3,6 +3,7 @@ import argparse
 
 import yolo_pose
 from segmenter import Segmenter
+from manual_role_assignment import ManualRoleAssignment
 #import room_tracker
 #from dancer_tracker import DancerTracker
 from debug_video import DebugVideo
@@ -18,14 +19,16 @@ def main(input_video, output_dir):
     yoloPose = yolo_pose.YOLOPose(output_dir + "/figure-masks", output_dir + "/detections.json")
     yoloPose.detect_poses()
 
+    # manually assign roles to tracked persons
+    manual_assigner = ManualRoleAssignment(input_video, output_dir + "/detections.json", output_dir)
+    manual_assigner.process_tracks()
+
     #room_tracker.room_tracker(input_video, output_dir)
     #room_tracker.debug_video(input_video, output_dir, output_dir + "/deltas.json")
 
     # detect dancer gender and assign to lead or follow
     #dancer_tracker = DancerTracker(input_video, output_dir)
     #dancer_tracker.process_video()
-
-    
 
     debug_video = DebugVideo(input_video, output_dir)
     debug_video.generate_debug_video()
