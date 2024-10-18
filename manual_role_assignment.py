@@ -14,6 +14,8 @@ class ManualRoleAssignment:
         self.cap = cv2.VideoCapture(input_video)
         self.lead_tracks = {}
         self.follow_tracks = {}
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.min_height_threshold = 0.2 * self.frame_height
         self.current_track_id = self.find_first_track_id()
         self.window_name = "Manual Role Assignment"
         cv2.namedWindow(self.window_name)
@@ -62,27 +64,33 @@ class ManualRoleAssignment:
         all_track_ids = set()
         for detections in self.detections.values():
             for detection in detections:
-                all_track_ids.add(detection['id'])
+                if self.is_valid_detection(detection):
+                    all_track_ids.add(detection['id'])
         return min(all_track_ids) if all_track_ids else None
 
     def find_next_track_id(self, current_id):
         all_track_ids = set()
         for detections in self.detections.values():
             for detection in detections:
-                if detection['id'] > current_id:
+                if detection['id'] > current_id and self.is_valid_detection(detection):
                     all_track_ids.add(detection['id'])
         return min(all_track_ids) if all_track_ids else None
 
     def find_first_appearance(self, track_id):
         for frame, detections in self.detections.items():
             for detection in detections:
-                if detection['id'] == track_id:
+                if detection['id'] == track_id and self.is_valid_detection(detection):
                     return int(frame)
         return None
 
     def get_person_crop(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
         return frame[y1:y2, x1:x2]
+
+    def is_valid_detection(self, detection):
+        bbox = detection['bbox']
+        height = bbox[3] - bbox[1]
+        return height >= self.min_height_threshold
 
     def process_tracks(self):
         lead_file = self.output_dir / "lead.json"
@@ -103,7 +111,7 @@ class ManualRoleAssignment:
             if not ret:
                 break
 
-            person = next((d for d in self.detections[str(frame_index)] if d['id'] == self.current_track_id), None)
+            person = next((d for d in self.detections[str(frame_index)] if d['id'] == self.current_track_id and self.is_valid_detection(d)), None)
             if person is None:
                 self.current_track_id = self.find_next_track_id(self.current_track_id)
                 continue
@@ -136,7 +144,7 @@ class ManualRoleAssignment:
         tracks = self.lead_tracks if role == 'lead' else self.follow_tracks
         for frame, detections in self.detections.items():
             for detection in detections:
-                if detection['id'] == self.current_track_id:
+                if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
                     if frame not in tracks:
                         tracks[frame] = []
                     tracks[frame].append(detection)
