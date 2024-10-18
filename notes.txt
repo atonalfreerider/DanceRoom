@@ -20,4 +20,4 @@ Useful Rules
 6 - the camera is likely at chest level
 
 
-https://universe.roboflow.com/timfowe/man-woman-detection
+https://universe.roboflow.com/timfowe/training-mw-dataset/dataset/1
