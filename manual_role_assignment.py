@@ -15,7 +15,7 @@ class ManualRoleAssignment:
         self.lead_tracks = {}
         self.follow_tracks = {}
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.min_height_threshold = 0.2 * self.frame_height
+        self.min_height_threshold = 0.5 * self.frame_height
         self.current_track_id = self.find_first_track_id()
         self.window_name = "Manual Role Assignment"
         cv2.namedWindow(self.window_name)
@@ -33,6 +33,12 @@ class ManualRoleAssignment:
         self.current_hover_index = None
         self.current_track_assignments = {'lead': {}, 'follow': {}}
         self.split_point = None
+        self.button_color = (200, 200, 200)  # Light gray
+        self.button_text_color = (0, 0, 0)  # Black
+        self.button_height = 40
+        self.button_width = 150
+        self.num_samples = 20  # Increased number of samples
+        self.is_hovering = False
 
     @staticmethod
     def load_json(json_path):
@@ -61,7 +67,9 @@ class ManualRoleAssignment:
         with open(follow_file, 'w') as f:
             json.dump(follow_tracks, f, indent=2)
 
-        messagebox.showinfo("Save Complete", "Lead and Follow JSON files have been saved.")
+        cv2.putText(self.current_collage, "Saved!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.imshow(self.window_name, self.current_collage)
+        cv2.waitKey(1000)  # Display "Saved!" message for 1 second
 
     def find_first_track_id(self):
         all_track_ids = set()
@@ -173,6 +181,16 @@ class ManualRoleAssignment:
             col = i % 5
             collage[row*self.crop_size[1]:(row+1)*self.crop_size[1], col*self.crop_size[0]:(col+1)*self.crop_size[0]] = crop
 
+        # Add space for the "Save to JSON" button
+        button_space = np.zeros((self.button_height, collage.shape[1], 3), dtype=np.uint8)
+        collage = np.vstack((collage, button_space))
+
+        # Draw the "Save to JSON" button
+        button_top = collage.shape[0] - self.button_height
+        button_left = (collage.shape[1] - self.button_width) // 2
+        cv2.rectangle(collage, (button_left, button_top), (button_left + self.button_width, button_top + self.button_height), self.button_color, -1)
+        cv2.putText(collage, "Save to JSON", (button_left + 10, button_top + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
+
         return collage
 
     def get_recursive_samples(self, start_frame, end_frame):
@@ -192,9 +210,12 @@ class ManualRoleAssignment:
         index = row * 5 + col
 
         if event == cv2.EVENT_MOUSEMOVE:
-            self.current_hover_index = index if index < len(self.current_samples) else None
-
-        if event == cv2.EVENT_LBUTTONDOWN:
+            if index < len(self.current_samples):
+                self.current_hover_index = index
+                self.is_hovering = True
+            else:
+                self.is_hovering = False
+        elif event == cv2.EVENT_LBUTTONDOWN:
             if self.recursive_depth == 0:
                 if index < len(self.sample_frames):
                     if index > 0:
@@ -222,6 +243,14 @@ class ManualRoleAssignment:
                             self.recursive_depth += 1
                             self.show_detailed_view()
 
+        # Check if the click is on the "Save to JSON" button
+        if self.current_collage is not None:
+            button_top = self.current_collage.shape[0] - self.button_height
+            button_left = (self.current_collage.shape[1] - self.button_width) // 2
+            if button_left <= x <= button_left + self.button_width and button_top <= y <= button_top + self.button_height:
+                self.save_json_files()
+                return
+
     def show_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
         if detailed_collage is not None:
@@ -242,11 +271,11 @@ class ManualRoleAssignment:
             self.split_point = None
             
             person_frames = self.find_person_frames(self.current_track_id)
-            if len(person_frames) < 10:
+            if len(person_frames) < self.num_samples:
                 sample_frames = person_frames
             else:
-                step = (len(person_frames) - 1) // 9
-                sample_frames = person_frames[::step][:10]
+                step = (len(person_frames) - 1) // (self.num_samples - 1)
+                sample_frames = person_frames[::step][:self.num_samples]
             
             self.sample_frames = sample_frames
             self.current_samples = self.sample_frames
@@ -256,7 +285,6 @@ class ManualRoleAssignment:
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27:  # ESC key
                     cv2.destroyAllWindows()
-                    self.root.destroy()
                     return
                 elif key == 82:  # Up arrow
                     self.assign_role_with_hover('lead')
@@ -272,8 +300,6 @@ class ManualRoleAssignment:
 
         self.update_final_tracks()
         cv2.destroyAllWindows()
-        self.root.deiconify()  # Show the save button window
-        self.root.mainloop()
 
     def show_main_collage(self):
         self.current_collage = self.create_collage(self.current_track_id, self.sample_frames)
@@ -281,18 +307,20 @@ class ManualRoleAssignment:
             cv2.imshow(self.window_name, self.current_collage)
 
     def assign_role_with_hover(self, role):
-        if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
-            self.split_point = self.current_samples[self.current_hover_index]
+        if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+            if self.recursive_depth >= self.max_recursive_depth or len(self.current_samples) == 2:
+                self.split_point = self.current_samples[self.current_hover_index]
+                self.assign_role(role, self.split_point)
+                self.show_main_collage()
+                if self.recursive_depth > 0:
+                    self.show_detailed_view()
+                self.split_point = None
         else:
-            self.split_point = self.current_samples[0]
-        
-        self.assign_role(role, self.split_point)
-        self.show_main_collage()
-        if self.recursive_depth > 0:
-            self.show_detailed_view()
-        
-        # Clear the split point after assignment
-        self.split_point = None
+            # Assign role to entire track if not hovering or at coarse resolution
+            self.assign_role(role, self.current_samples[0])
+            self.show_main_collage()
+            if self.recursive_depth > 0:
+                self.show_detailed_view()
 
     def assign_role(self, role, start_frame):
         other_role = 'follow' if role == 'lead' else 'lead'
