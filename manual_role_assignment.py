@@ -19,7 +19,11 @@ class ManualRoleAssignment:
         self.current_track_id = self.find_first_track_id()
         self.window_name = "Manual Role Assignment"
         cv2.namedWindow(self.window_name)
+        cv2.setMouseCallback(self.window_name, self.mouse_callback)
         self.setup_gui()
+        self.sample_frames = []
+        self.current_collage = None
+        self.crop_size = (160, 320)  # Increased size for better visibility
 
     @staticmethod
     def load_json(json_path):
@@ -39,26 +43,12 @@ class ManualRoleAssignment:
         follow_file = self.output_dir / "follow.json"
 
         with open(lead_file, 'w') as f:
-            json.dump(self.numpy_to_python(self.lead_tracks), f, indent=2)
+            json.dump(self.lead_tracks, f, indent=2)
         
         with open(follow_file, 'w') as f:
-            json.dump(self.numpy_to_python(self.follow_tracks), f, indent=2)
+            json.dump(self.follow_tracks, f, indent=2)
 
         messagebox.showinfo("Save Complete", "Lead and Follow JSON files have been saved.")
-
-    def numpy_to_python(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return self.numpy_to_python(obj.tolist())
-        elif isinstance(obj, list):
-            return [self.numpy_to_python(item) for item in obj]
-        elif isinstance(obj, dict):
-            return {key: self.numpy_to_python(value) for key, value in obj.items()}
-        else:
-            return obj
 
     def find_first_track_id(self):
         all_track_ids = set()
@@ -76,12 +66,13 @@ class ManualRoleAssignment:
                     all_track_ids.add(detection['id'])
         return min(all_track_ids) if all_track_ids else None
 
-    def find_first_appearance(self, track_id):
+    def find_person_frames(self, track_id):
+        person_frames = []
         for frame, detections in self.detections.items():
             for detection in detections:
                 if detection['id'] == track_id and self.is_valid_detection(detection):
-                    return int(frame)
-        return None
+                    person_frames.append(int(frame))
+        return sorted(person_frames)
 
     def get_person_crop(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
@@ -92,6 +83,110 @@ class ManualRoleAssignment:
         height = bbox[3] - bbox[1]
         return height >= self.min_height_threshold
 
+    def draw_pose(self, image, keypoints, color):
+        connections = [
+            (0, 1), (0, 2), (1, 3), (2, 4),  # Head
+            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
+            (5, 11), (6, 12), (11, 13), (12, 14), (13, 15), (14, 16)  # Legs
+        ]
+
+        def get_point(kp):
+            if len(kp) >= 2 and (kp[0] > 0 and kp[1] > 0):  # Changed condition here
+                return (int(kp[0]), int(kp[1]))
+            return None
+
+        # Draw connections
+        for connection in connections:
+            start_point = get_point(keypoints[connection[0]])
+            end_point = get_point(keypoints[connection[1]])
+            if start_point and end_point:
+                cv2.line(image, start_point, end_point, color, 3)
+
+        # Draw keypoints
+        for point in keypoints:
+            pt = get_point(point)
+            if pt:
+                cv2.circle(image, pt, 5, color, -1)
+
+    def create_collage(self, track_id, sample_frames):
+        crops = []
+        for frame_idx in sample_frames:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+
+            person = next((d for d in self.detections[str(frame_idx)] if d['id'] == track_id), None)
+            if person is None:
+                continue
+
+            bbox = person['bbox']
+            x1, y1, x2, y2 = map(int, bbox)
+            crop = frame[y1:y2, x1:x2]
+            crop_resized = cv2.resize(crop, self.crop_size)
+            
+            # Draw the pose on the resized crop
+            keypoints = person['keypoints']
+            adjusted_keypoints = [
+                [kp[0] - x1, kp[1] - y1] + kp[2:] for kp in keypoints
+            ]
+            scale_x = self.crop_size[0] / (x2 - x1)
+            scale_y = self.crop_size[1] / (y2 - y1)
+            scaled_keypoints = [
+                [kp[0] * scale_x, kp[1] * scale_y] + kp[2:] for kp in adjusted_keypoints
+            ]
+            self.draw_pose(crop_resized, scaled_keypoints, (0, 255, 0))  # Bright green color for pose
+            
+            crops.append(crop_resized)
+
+        if not crops:
+            return None
+
+        # Create the collage
+        rows = (len(crops) + 4) // 5  # 5 images per row, rounded up
+        cols = min(5, len(crops))
+        collage = np.zeros((rows * self.crop_size[1], cols * self.crop_size[0], 3), dtype=np.uint8)
+
+        for i, crop in enumerate(crops):
+            row = i // 5
+            col = i % 5
+            collage[row*self.crop_size[1]:(row+1)*self.crop_size[1], col*self.crop_size[0]:(col+1)*self.crop_size[0]] = crop
+
+        return collage
+
+    def mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN or event == cv2.EVENT_RBUTTONDOWN:
+            row = y // self.crop_size[1]
+            col = x // self.crop_size[0]
+            index = row * 5 + col
+
+            if index < len(self.sample_frames):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    self.assign_role('lead', self.sample_frames[index])
+                elif event == cv2.EVENT_RBUTTONDOWN:
+                    self.assign_role('follow', self.sample_frames[index])
+
+                if index > 0:
+                    # Show detailed collage between the previous and current sample
+                    start_frame = self.sample_frames[index - 1]
+                    end_frame = self.sample_frames[index]
+                    person_frames = self.find_person_frames(self.current_track_id)
+                    start_idx = person_frames.index(start_frame)
+                    end_idx = person_frames.index(end_frame)
+                    
+                    # Get 10 evenly spaced frames between start and end (inclusive)
+                    if start_idx == end_idx:
+                        detailed_frames = [start_frame]
+                    else:
+                        step = (end_idx - start_idx) / 9
+                        detailed_frames = [person_frames[int(start_idx + i * step)] for i in range(10)]
+                    
+                    detailed_collage = self.create_collage(self.current_track_id, detailed_frames)
+                    if detailed_collage is not None:
+                        cv2.imshow("Detailed View", detailed_collage)
+                        cv2.waitKey(0)
+                        cv2.destroyWindow("Detailed View")
+
     def process_tracks(self):
         lead_file = self.output_dir / "lead.json"
         follow_file = self.output_dir / "follow.json"
@@ -101,53 +196,40 @@ class ManualRoleAssignment:
             return
 
         while self.current_track_id is not None:
-            frame_index = self.find_first_appearance(self.current_track_id)
-            if frame_index is None:
+            person_frames = self.find_person_frames(self.current_track_id)
+            if len(person_frames) < 10:
+                sample_frames = person_frames
+            else:
+                step = (len(person_frames) - 1) // 9
+                sample_frames = person_frames[::step][:10]
+            
+            self.sample_frames = sample_frames
+            self.current_collage = self.create_collage(self.current_track_id, sample_frames)
+            if self.current_collage is None:
                 self.current_track_id = self.find_next_track_id(self.current_track_id)
                 continue
 
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ret, frame = self.cap.read()
-            if not ret:
+            cv2.imshow(self.window_name, self.current_collage)
+
+            key = cv2.waitKey(0) & 0xFF
+            if key == 27:  # ESC key
                 break
-
-            person = next((d for d in self.detections[str(frame_index)] if d['id'] == self.current_track_id and self.is_valid_detection(d)), None)
-            if person is None:
+            elif key == 83:  # Right arrow
                 self.current_track_id = self.find_next_track_id(self.current_track_id)
-                continue
-
-            crop = self.get_person_crop(frame, person['bbox'])
-            cv2.imshow(self.window_name, crop)
-
-            while True:
-                key = cv2.waitKey(0) & 0xFF
-                if key == 27:  # ESC key
-                    cv2.destroyAllWindows()
-                    self.root.destroy()
-                    return
-                elif key == 82:  # Up arrow
-                    self.assign_role('lead')
-                    break
-                elif key == 84:  # Down arrow
-                    self.assign_role('follow')
-                    break
-                elif key == 83:  # Right arrow
-                    break
-
-            self.current_track_id = self.find_next_track_id(self.current_track_id)
 
         cv2.destroyAllWindows()
         self.root.deiconify()  # Show the save button window
         self.root.mainloop()
 
-    def assign_role(self, role):
+    def assign_role(self, role, start_frame):
         tracks = self.lead_tracks if role == 'lead' else self.follow_tracks
         for frame, detections in self.detections.items():
-            for detection in detections:
-                if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
-                    if frame not in tracks:
-                        tracks[frame] = []
-                    tracks[frame].append(detection)
+            if int(frame) >= start_frame:
+                for detection in detections:
+                    if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
+                        if frame not in tracks:
+                            tracks[frame] = []
+                        tracks[frame].append(detection)
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
