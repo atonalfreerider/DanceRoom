@@ -27,6 +27,10 @@ class ManualRoleAssignment:
         self.recursive_samples = []
         self.recursive_depth = 0
         self.max_recursive_depth = 10  # Adjust this based on your video frame rate
+        self.lead_color = (255, 0, 0)  # Blue
+        self.follow_color = (255, 0, 255)  # Magenta
+        self.unassigned_color = (0, 255, 0)  # Green
+        self.current_hover_index = None
 
     @staticmethod
     def load_json(json_path):
@@ -128,6 +132,14 @@ class ManualRoleAssignment:
             crop = frame[y1:y2, x1:x2]
             crop_resized = cv2.resize(crop, self.crop_size)
             
+            # Determine the color based on the role assignment
+            if str(frame_idx) in self.lead_tracks:
+                color = self.lead_color
+            elif str(frame_idx) in self.follow_tracks:
+                color = self.follow_color
+            else:
+                color = self.unassigned_color
+
             # Draw the pose on the resized crop
             keypoints = person['keypoints']
             adjusted_keypoints = [
@@ -138,7 +150,7 @@ class ManualRoleAssignment:
             scaled_keypoints = [
                 [kp[0] * scale_x, kp[1] * scale_y] + kp[2:] for kp in adjusted_keypoints
             ]
-            self.draw_pose(crop_resized, scaled_keypoints, (0, 255, 0))  # Bright green color for pose
+            self.draw_pose(crop_resized, scaled_keypoints, color)
             
             crops.append(crop_resized)
 
@@ -169,11 +181,14 @@ class ManualRoleAssignment:
         return [person_frames[int(start_idx + i * step)] for i in range(10)]
 
     def mouse_callback(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN or event == cv2.EVENT_RBUTTONDOWN:
-            row = y // self.crop_size[1]
-            col = x // self.crop_size[0]
-            index = row * 5 + col
+        row = y // self.crop_size[1]
+        col = x // self.crop_size[0]
+        index = row * 5 + col
 
+        if event == cv2.EVENT_MOUSEMOVE:
+            self.current_hover_index = index if index < len(self.current_samples) else None
+
+        if event == cv2.EVENT_LBUTTONDOWN:
             if self.recursive_depth == 0:
                 if index < len(self.sample_frames):
                     if index > 0:
@@ -181,9 +196,8 @@ class ManualRoleAssignment:
                         end_frame = self.sample_frames[index]
                         self.recursive_samples = self.get_recursive_samples(start_frame, end_frame)
                         self.recursive_depth += 1
-                        detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
-                        if detailed_collage is not None:
-                            cv2.imshow("Detailed View", detailed_collage)
+                        self.current_samples = self.recursive_samples
+                        self.show_detailed_view()
             else:
                 if index < len(self.recursive_samples):
                     if index > 0:
@@ -193,22 +207,20 @@ class ManualRoleAssignment:
                         
                         if len(new_samples) == 2 or self.recursive_depth >= self.max_recursive_depth:
                             # We've reached the finest resolution or max depth
-                            selected_frame = new_samples[1]  # The end frame of the selected interval
-                            if event == cv2.EVENT_LBUTTONDOWN:
-                                self.assign_role('lead', selected_frame, True)
-                                self.assign_role('follow', selected_frame, False)
-                            elif event == cv2.EVENT_RBUTTONDOWN:
-                                self.assign_role('follow', selected_frame, True)
-                                self.assign_role('lead', selected_frame, False)
-                            cv2.destroyWindow("Detailed View")
-                            self.recursive_depth = 0
-                            self.recursive_samples = []
+                            self.recursive_samples = new_samples
+                            self.current_samples = self.recursive_samples
+                            self.show_detailed_view()
                         else:
                             self.recursive_samples = new_samples
+                            self.current_samples = self.recursive_samples
                             self.recursive_depth += 1
-                            detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
-                            if detailed_collage is not None:
-                                cv2.imshow("Detailed View", detailed_collage)
+                            self.show_detailed_view()
+
+    def show_detailed_view(self):
+        detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
+        if detailed_collage is not None:
+            cv2.imshow("Detailed View", detailed_collage)
+            cv2.setMouseCallback("Detailed View", self.mouse_callback)
 
     def process_tracks(self):
         lead_file = self.output_dir / "lead.json"
@@ -227,33 +239,67 @@ class ManualRoleAssignment:
                 sample_frames = person_frames[::step][:10]
             
             self.sample_frames = sample_frames
-            self.current_collage = self.create_collage(self.current_track_id, sample_frames)
-            if self.current_collage is None:
-                self.current_track_id = self.find_next_track_id(self.current_track_id)
-                continue
+            self.current_samples = self.sample_frames
+            self.show_main_collage()
 
-            cv2.imshow(self.window_name, self.current_collage)
-
-            key = cv2.waitKey(0) & 0xFF
-            if key == 27:  # ESC key
-                break
-            elif key == 83:  # Right arrow
-                self.current_track_id = self.find_next_track_id(self.current_track_id)
+            while True:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC key
+                    cv2.destroyAllWindows()
+                    self.root.destroy()
+                    return
+                elif key == 82:  # Up arrow
+                    self.assign_role_with_hover('lead')
+                elif key == 84:  # Down arrow
+                    self.assign_role_with_hover('follow')
+                elif key == 83:  # Right arrow
+                    self.current_track_id = self.find_next_track_id(self.current_track_id)
+                    self.recursive_depth = 0
+                    self.recursive_samples = []
+                    cv2.destroyWindow("Detailed View")
+                    break
 
         cv2.destroyAllWindows()
         self.root.deiconify()  # Show the save button window
         self.root.mainloop()
 
-    def assign_role(self, role, start_frame, future=True):
+    def show_main_collage(self):
+        self.current_collage = self.create_collage(self.current_track_id, self.sample_frames)
+        if self.current_collage is not None:
+            cv2.imshow(self.window_name, self.current_collage)
+
+    def assign_role_with_hover(self, role):
+        if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+            start_frame = self.current_samples[self.current_hover_index]
+        else:
+            start_frame = self.current_samples[0]
+        
+        self.assign_role(role, start_frame)
+        self.show_main_collage()
+        if self.recursive_depth > 0:
+            self.show_detailed_view()
+
+    def assign_role(self, role, start_frame):
         tracks = self.lead_tracks if role == 'lead' else self.follow_tracks
+        other_tracks = self.follow_tracks if role == 'lead' else self.lead_tracks
         for frame, detections in self.detections.items():
             frame_num = int(frame)
-            if (future and frame_num >= start_frame) or (not future and frame_num < start_frame):
+            if frame_num >= start_frame:
                 for detection in detections:
                     if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
                         if frame not in tracks:
                             tracks[frame] = []
                         tracks[frame].append(detection)
+                        if frame in other_tracks:
+                            other_tracks[frame] = [d for d in other_tracks[frame] if d['id'] != self.current_track_id]
+            elif frame_num < start_frame:
+                for detection in detections:
+                    if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
+                        if frame not in other_tracks:
+                            other_tracks[frame] = []
+                        other_tracks[frame].append(detection)
+                        if frame in tracks:
+                            tracks[frame] = [d for d in tracks[frame] if d['id'] != self.current_track_id]
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
