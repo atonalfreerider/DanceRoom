@@ -292,18 +292,6 @@ class ManualRoleAssignment:
             cv2.resizeWindow("Detailed View", 1920, 1080)
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.mouse_callback)
-            
-            while True:
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27 or cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:  # ESC key or window closed
-                    cv2.destroyWindow("Detailed View")
-                    self.reset_recursive_state()
-                    self.show_main_collage()
-                    break
-                elif key == 82:  # Up arrow
-                    self.assign_role_with_hover('lead')
-                elif key == 84:  # Down arrow
-                    self.assign_role_with_hover('follow')
 
     def process_tracks(self):
         lead_file = self.output_dir / "lead.json"
@@ -322,7 +310,7 @@ class ManualRoleAssignment:
             else:
                 step = (len(person_frames) - 1) // (self.num_samples - 1)
                 sample_frames = person_frames[::step][:self.num_samples]
-            
+        
             self.sample_frames = sample_frames
             self.current_samples = self.sample_frames
             self.show_main_collage()
@@ -339,7 +327,13 @@ class ManualRoleAssignment:
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
+                    cv2.destroyWindow("Detailed View")
                     break
+            
+            # Check if detailed view is closed
+            if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
+                self.reset_recursive_state()
+                self.show_main_collage()
 
         self.update_final_tracks()
         cv2.destroyAllWindows()
