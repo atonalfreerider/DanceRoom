@@ -24,6 +24,9 @@ class ManualRoleAssignment:
         self.sample_frames = []
         self.current_collage = None
         self.crop_size = (160, 320)  # Increased size for better visibility
+        self.recursive_samples = []
+        self.recursive_depth = 0
+        self.max_recursive_depth = 10  # Adjust this based on your video frame rate
 
     @staticmethod
     def load_json(json_path):
@@ -154,38 +157,58 @@ class ManualRoleAssignment:
 
         return collage
 
+    def get_recursive_samples(self, start_frame, end_frame):
+        person_frames = self.find_person_frames(self.current_track_id)
+        start_idx = person_frames.index(start_frame)
+        end_idx = person_frames.index(end_frame)
+        
+        if end_idx - start_idx <= 1:
+            return [start_frame, end_frame]
+        
+        step = (end_idx - start_idx) / 9
+        return [person_frames[int(start_idx + i * step)] for i in range(10)]
+
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN or event == cv2.EVENT_RBUTTONDOWN:
             row = y // self.crop_size[1]
             col = x // self.crop_size[0]
             index = row * 5 + col
 
-            if index < len(self.sample_frames):
-                if event == cv2.EVENT_LBUTTONDOWN:
-                    self.assign_role('lead', self.sample_frames[index])
-                elif event == cv2.EVENT_RBUTTONDOWN:
-                    self.assign_role('follow', self.sample_frames[index])
-
-                if index > 0:
-                    # Show detailed collage between the previous and current sample
-                    start_frame = self.sample_frames[index - 1]
-                    end_frame = self.sample_frames[index]
-                    person_frames = self.find_person_frames(self.current_track_id)
-                    start_idx = person_frames.index(start_frame)
-                    end_idx = person_frames.index(end_frame)
-                    
-                    # Get 10 evenly spaced frames between start and end (inclusive)
-                    if start_idx == end_idx:
-                        detailed_frames = [start_frame]
-                    else:
-                        step = (end_idx - start_idx) / 9
-                        detailed_frames = [person_frames[int(start_idx + i * step)] for i in range(10)]
-                    
-                    detailed_collage = self.create_collage(self.current_track_id, detailed_frames)
-                    if detailed_collage is not None:
-                        cv2.imshow("Detailed View", detailed_collage)
-                        cv2.waitKey(0)
-                        cv2.destroyWindow("Detailed View")
+            if self.recursive_depth == 0:
+                if index < len(self.sample_frames):
+                    if index > 0:
+                        start_frame = self.sample_frames[index - 1]
+                        end_frame = self.sample_frames[index]
+                        self.recursive_samples = self.get_recursive_samples(start_frame, end_frame)
+                        self.recursive_depth += 1
+                        detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
+                        if detailed_collage is not None:
+                            cv2.imshow("Detailed View", detailed_collage)
+            else:
+                if index < len(self.recursive_samples):
+                    if index > 0:
+                        start_frame = self.recursive_samples[index - 1]
+                        end_frame = self.recursive_samples[index]
+                        new_samples = self.get_recursive_samples(start_frame, end_frame)
+                        
+                        if len(new_samples) == 2 or self.recursive_depth >= self.max_recursive_depth:
+                            # We've reached the finest resolution or max depth
+                            selected_frame = new_samples[1]  # The end frame of the selected interval
+                            if event == cv2.EVENT_LBUTTONDOWN:
+                                self.assign_role('lead', selected_frame, True)
+                                self.assign_role('follow', selected_frame, False)
+                            elif event == cv2.EVENT_RBUTTONDOWN:
+                                self.assign_role('follow', selected_frame, True)
+                                self.assign_role('lead', selected_frame, False)
+                            cv2.destroyWindow("Detailed View")
+                            self.recursive_depth = 0
+                            self.recursive_samples = []
+                        else:
+                            self.recursive_samples = new_samples
+                            self.recursive_depth += 1
+                            detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
+                            if detailed_collage is not None:
+                                cv2.imshow("Detailed View", detailed_collage)
 
     def process_tracks(self):
         lead_file = self.output_dir / "lead.json"
@@ -221,10 +244,11 @@ class ManualRoleAssignment:
         self.root.deiconify()  # Show the save button window
         self.root.mainloop()
 
-    def assign_role(self, role, start_frame):
+    def assign_role(self, role, start_frame, future=True):
         tracks = self.lead_tracks if role == 'lead' else self.follow_tracks
         for frame, detections in self.detections.items():
-            if int(frame) >= start_frame:
+            frame_num = int(frame)
+            if (future and frame_num >= start_frame) or (not future and frame_num < start_frame):
                 for detection in detections:
                     if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
                         if frame not in tracks:
