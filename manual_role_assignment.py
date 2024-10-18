@@ -31,6 +31,8 @@ class ManualRoleAssignment:
         self.follow_color = (255, 0, 255)  # Magenta
         self.unassigned_color = (0, 255, 0)  # Green
         self.current_hover_index = None
+        self.current_track_assignments = {'lead': {}, 'follow': {}}
+        self.split_point = None
 
     @staticmethod
     def load_json(json_path):
@@ -49,11 +51,15 @@ class ManualRoleAssignment:
         lead_file = self.output_dir / "lead.json"
         follow_file = self.output_dir / "follow.json"
 
+        # Remove empty lists before saving
+        lead_tracks = {k: v for k, v in self.lead_tracks.items() if v}
+        follow_tracks = {k: v for k, v in self.follow_tracks.items() if v}
+
         with open(lead_file, 'w') as f:
-            json.dump(self.lead_tracks, f, indent=2)
+            json.dump(lead_tracks, f, indent=2)
         
         with open(follow_file, 'w') as f:
-            json.dump(self.follow_tracks, f, indent=2)
+            json.dump(follow_tracks, f, indent=2)
 
         messagebox.showinfo("Save Complete", "Lead and Follow JSON files have been saved.")
 
@@ -132,10 +138,10 @@ class ManualRoleAssignment:
             crop = frame[y1:y2, x1:x2]
             crop_resized = cv2.resize(crop, self.crop_size)
             
-            # Determine the color based on the role assignment
-            if str(frame_idx) in self.lead_tracks:
+            # Determine the color based on the current track assignments
+            if str(frame_idx) in self.current_track_assignments['lead']:
                 color = self.lead_color
-            elif str(frame_idx) in self.follow_tracks:
+            elif str(frame_idx) in self.current_track_assignments['follow']:
                 color = self.follow_color
             else:
                 color = self.unassigned_color
@@ -231,6 +237,10 @@ class ManualRoleAssignment:
             return
 
         while self.current_track_id is not None:
+            # Reset assignments and split point for the new track
+            self.current_track_assignments = {'lead': {}, 'follow': {}}
+            self.split_point = None
+            
             person_frames = self.find_person_frames(self.current_track_id)
             if len(person_frames) < 10:
                 sample_frames = person_frames
@@ -253,12 +263,14 @@ class ManualRoleAssignment:
                 elif key == 84:  # Down arrow
                     self.assign_role_with_hover('follow')
                 elif key == 83:  # Right arrow
+                    self.update_final_tracks()
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
                     self.recursive_depth = 0
                     self.recursive_samples = []
                     cv2.destroyWindow("Detailed View")
                     break
 
+        self.update_final_tracks()
         cv2.destroyAllWindows()
         self.root.deiconify()  # Show the save button window
         self.root.mainloop()
@@ -270,36 +282,48 @@ class ManualRoleAssignment:
 
     def assign_role_with_hover(self, role):
         if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
-            start_frame = self.current_samples[self.current_hover_index]
+            self.split_point = self.current_samples[self.current_hover_index]
         else:
-            start_frame = self.current_samples[0]
+            self.split_point = self.current_samples[0]
         
-        self.assign_role(role, start_frame)
+        self.assign_role(role, self.split_point)
         self.show_main_collage()
         if self.recursive_depth > 0:
             self.show_detailed_view()
+        
+        # Clear the split point after assignment
+        self.split_point = None
 
     def assign_role(self, role, start_frame):
-        tracks = self.lead_tracks if role == 'lead' else self.follow_tracks
-        other_tracks = self.follow_tracks if role == 'lead' else self.lead_tracks
+        other_role = 'follow' if role == 'lead' else 'lead'
+        
         for frame, detections in self.detections.items():
             frame_num = int(frame)
             if frame_num >= start_frame:
                 for detection in detections:
                     if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
-                        if frame not in tracks:
-                            tracks[frame] = []
-                        tracks[frame].append(detection)
-                        if frame in other_tracks:
-                            other_tracks[frame] = [d for d in other_tracks[frame] if d['id'] != self.current_track_id]
+                        self.current_track_assignments[role][frame] = detection
+                        self.current_track_assignments[other_role].pop(frame, None)
             elif frame_num < start_frame:
                 for detection in detections:
                     if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
-                        if frame not in other_tracks:
-                            other_tracks[frame] = []
-                        other_tracks[frame].append(detection)
-                        if frame in tracks:
-                            tracks[frame] = [d for d in tracks[frame] if d['id'] != self.current_track_id]
+                        self.current_track_assignments[other_role][frame] = detection
+                        self.current_track_assignments[role].pop(frame, None)
+
+    def update_final_tracks(self):
+        for role in ['lead', 'follow']:
+            for frame, detection in self.current_track_assignments[role].items():
+                if frame not in self.lead_tracks:
+                    self.lead_tracks[frame] = []
+                if frame not in self.follow_tracks:
+                    self.follow_tracks[frame] = []
+                
+                if role == 'lead':
+                    self.lead_tracks[frame] = [detection]
+                    self.follow_tracks[frame] = [d for d in self.follow_tracks[frame] if d['id'] != self.current_track_id]
+                else:
+                    self.follow_tracks[frame] = [detection]
+                    self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id]
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
