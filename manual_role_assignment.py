@@ -235,7 +235,9 @@ class ManualRoleAssignment:
     def reset_recursive_state(self):
         self.recursive_depth = 0
         self.recursive_samples = []
-        self.current_samples = self.sample_frames
+        self.current_samples = self.sample_frames.copy()  # Use a copy to avoid reference issues
+        self.current_hover_index = None
+        self.is_hovering = False
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -310,7 +312,7 @@ class ManualRoleAssignment:
             else:
                 step = (len(person_frames) - 1) // (self.num_samples - 1)
                 sample_frames = person_frames[::step][:self.num_samples]
-        
+            
             self.sample_frames = sample_frames
             self.current_samples = self.sample_frames
             self.show_main_collage()
@@ -329,11 +331,11 @@ class ManualRoleAssignment:
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
                     cv2.destroyWindow("Detailed View")
                     break
-            
-            # Check if detailed view is closed
-            if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
-                self.reset_recursive_state()
-                self.show_main_collage()
+                
+                # Check if detailed view is closed
+                if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
+                    self.reset_recursive_state()
+                    self.show_main_collage()
 
         self.update_final_tracks()
         cv2.destroyAllWindows()
