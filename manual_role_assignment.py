@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox
 
 class ManualRoleAssignment:
     def __init__(self, input_video, detections_file, output_dir):
@@ -18,12 +17,24 @@ class ManualRoleAssignment:
         self.min_height_threshold = 0.5 * self.frame_height
         self.current_track_id = self.find_first_track_id()
         self.window_name = "Manual Role Assignment"
-        cv2.namedWindow(self.window_name)
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, 1920, 1080)
+        self.screen_width = 1920
+        self.screen_height = 1080
+        self.num_columns = 6
+        self.num_rows = 4
+        self.num_samples = self.num_columns * self.num_rows
+        self.aspect_ratio = self.frame_height / int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.crop_size = self.calculate_crop_size()
+        self.detailed_crop_size = (int(self.crop_size[0] * 0.75), int(self.crop_size[1] * 0.75))
+        self.button_height = 40
+        self.button_width = 150
+        self.button_color = (200, 200, 200)  # Light gray
+        self.button_text_color = (0, 0, 0)  # Black
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
         self.setup_gui()
         self.sample_frames = []
         self.current_collage = None
-        self.crop_size = (160, 320)  # Increased size for better visibility
         self.recursive_samples = []
         self.recursive_depth = 0
         self.max_recursive_depth = 10  # Adjust this based on your video frame rate
@@ -33,11 +44,6 @@ class ManualRoleAssignment:
         self.current_hover_index = None
         self.current_track_assignments = {'lead': {}, 'follow': {}}
         self.split_point = None
-        self.button_color = (200, 200, 200)  # Light gray
-        self.button_text_color = (0, 0, 0)  # Black
-        self.button_height = 40
-        self.button_width = 150
-        self.num_samples = 20  # Increased number of samples
         self.is_hovering = False
 
     @staticmethod
@@ -129,8 +135,17 @@ class ManualRoleAssignment:
             if pt:
                 cv2.circle(image, pt, 5, color, -1)
 
-    def create_collage(self, track_id, sample_frames):
+    def calculate_crop_size(self):
+        width = self.screen_width // self.num_columns
+        height = int(width * self.aspect_ratio)
+        if height * self.num_rows > self.screen_height:
+            height = self.screen_height // self.num_rows
+            width = int(height / self.aspect_ratio)
+        return (width, height)
+
+    def create_collage(self, track_id, sample_frames, is_detailed=False):
         crops = []
+        crop_size = self.detailed_crop_size if is_detailed else self.crop_size
         for frame_idx in sample_frames:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = self.cap.read()
@@ -144,8 +159,31 @@ class ManualRoleAssignment:
             bbox = person['bbox']
             x1, y1, x2, y2 = map(int, bbox)
             crop = frame[y1:y2, x1:x2]
-            crop_resized = cv2.resize(crop, self.crop_size)
             
+            # Calculate the aspect ratio of the crop
+            crop_aspect = crop.shape[1] / crop.shape[0]
+            
+            # Calculate the target size maintaining the aspect ratio
+            if crop_aspect > crop_size[0] / crop_size[1]:
+                target_width = crop_size[0]
+                target_height = int(target_width / crop_aspect)
+            else:
+                target_height = crop_size[1]
+                target_width = int(target_height * crop_aspect)
+            
+            # Resize the crop
+            crop_resized = cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
+            
+            # Create a black background of the desired size
+            background = np.zeros((crop_size[1], crop_size[0], 3), dtype=np.uint8)
+            
+            # Calculate the position to paste the resized crop
+            y_offset = (crop_size[1] - target_height) // 2
+            x_offset = (crop_size[0] - target_width) // 2
+            
+            # Paste the resized crop onto the background
+            background[y_offset:y_offset+target_height, x_offset:x_offset+target_width] = crop_resized
+
             # Determine the color based on the current track assignments
             if str(frame_idx) in self.current_track_assignments['lead']:
                 color = self.lead_color
@@ -159,37 +197,38 @@ class ManualRoleAssignment:
             adjusted_keypoints = [
                 [kp[0] - x1, kp[1] - y1] + kp[2:] for kp in keypoints
             ]
-            scale_x = self.crop_size[0] / (x2 - x1)
-            scale_y = self.crop_size[1] / (y2 - y1)
+            scale_x = target_width / (x2 - x1)
+            scale_y = target_height / (y2 - y1)
             scaled_keypoints = [
-                [kp[0] * scale_x, kp[1] * scale_y] + kp[2:] for kp in adjusted_keypoints
+                [kp[0] * scale_x + x_offset, kp[1] * scale_y + y_offset] + kp[2:] for kp in adjusted_keypoints
             ]
-            self.draw_pose(crop_resized, scaled_keypoints, color)
+            self.draw_pose(background, scaled_keypoints, color)
             
-            crops.append(crop_resized)
+            crops.append(background)
 
         if not crops:
             return None
 
         # Create the collage
-        rows = (len(crops) + 4) // 5  # 5 images per row, rounded up
-        cols = min(5, len(crops))
-        collage = np.zeros((rows * self.crop_size[1], cols * self.crop_size[0], 3), dtype=np.uint8)
+        rows = self.num_rows
+        cols = self.num_columns
+        collage = np.zeros((rows * crop_size[1], cols * crop_size[0], 3), dtype=np.uint8)
 
         for i, crop in enumerate(crops):
-            row = i // 5
-            col = i % 5
-            collage[row*self.crop_size[1]:(row+1)*self.crop_size[1], col*self.crop_size[0]:(col+1)*self.crop_size[0]] = crop
-
-        # Add space for the "Save to JSON" button
-        button_space = np.zeros((self.button_height, collage.shape[1], 3), dtype=np.uint8)
-        collage = np.vstack((collage, button_space))
+            if i >= self.num_samples:
+                break
+            row = i // cols
+            col = i % cols
+            collage[row*crop_size[1]:(row+1)*crop_size[1], col*crop_size[0]:(col+1)*crop_size[0]] = crop
 
         # Draw the "Save to JSON" button
-        button_top = collage.shape[0] - self.button_height
-        button_left = (collage.shape[1] - self.button_width) // 2
-        cv2.rectangle(collage, (button_left, button_top), (button_left + self.button_width, button_top + self.button_height), self.button_color, -1)
-        cv2.putText(collage, "Save to JSON", (button_left + 10, button_top + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
+        button_top = collage.shape[0] - self.button_height - 10
+        button_left = collage.shape[1] - self.button_width - 10
+        cv2.rectangle(collage, (button_left, button_top), 
+                      (button_left + self.button_width, button_top + self.button_height), 
+                      self.button_color, -1)
+        cv2.putText(collage, "Save to JSON", (button_left + 10, button_top + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
 
         return collage
 
@@ -207,17 +246,24 @@ class ManualRoleAssignment:
     def mouse_callback(self, event, x, y, flags, param):
         row = y // self.crop_size[1]
         col = x // self.crop_size[0]
-        index = row * 5 + col
+        index = row * self.num_columns + col
 
         if event == cv2.EVENT_MOUSEMOVE:
-            if index < len(self.current_samples):
+            if index < self.num_samples:
                 self.current_hover_index = index
                 self.is_hovering = True
             else:
                 self.is_hovering = False
         elif event == cv2.EVENT_LBUTTONDOWN:
-            if self.recursive_depth == 0:
-                if index < len(self.sample_frames):
+            # Check if the click is on the "Save to JSON" button
+            button_top = self.screen_height - self.button_height - 10
+            button_left = self.screen_width - self.button_width - 10
+            if button_left <= x <= button_left + self.button_width and button_top <= y <= button_top + self.button_height:
+                self.save_json_files()
+                return
+
+            if index < self.num_samples:
+                if self.recursive_depth == 0:
                     if index > 0:
                         start_frame = self.sample_frames[index - 1]
                         end_frame = self.sample_frames[index]
@@ -225,8 +271,7 @@ class ManualRoleAssignment:
                         self.recursive_depth += 1
                         self.current_samples = self.recursive_samples
                         self.show_detailed_view()
-            else:
-                if index < len(self.recursive_samples):
+                else:
                     if index > 0:
                         start_frame = self.recursive_samples[index - 1]
                         end_frame = self.recursive_samples[index]
@@ -243,17 +288,11 @@ class ManualRoleAssignment:
                             self.recursive_depth += 1
                             self.show_detailed_view()
 
-        # Check if the click is on the "Save to JSON" button
-        if self.current_collage is not None:
-            button_top = self.current_collage.shape[0] - self.button_height
-            button_left = (self.current_collage.shape[1] - self.button_width) // 2
-            if button_left <= x <= button_left + self.button_width and button_top <= y <= button_top + self.button_height:
-                self.save_json_files()
-                return
-
     def show_detailed_view(self):
-        detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples)
+        detailed_collage = self.create_collage(self.current_track_id, self.recursive_samples, is_detailed=True)
         if detailed_collage is not None:
+            cv2.namedWindow("Detailed View", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Detailed View", 1920, 1080)
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.mouse_callback)
 
@@ -266,9 +305,7 @@ class ManualRoleAssignment:
             return
 
         while self.current_track_id is not None:
-            # Reset assignments and split point for the new track
-            self.current_track_assignments = {'lead': {}, 'follow': {}}
-            self.split_point = None
+            self.reset_track_variables()
             
             person_frames = self.find_person_frames(self.current_track_id)
             if len(person_frames) < self.num_samples:
@@ -293,13 +330,20 @@ class ManualRoleAssignment:
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
-                    self.recursive_depth = 0
-                    self.recursive_samples = []
                     cv2.destroyWindow("Detailed View")
                     break
 
         self.update_final_tracks()
         cv2.destroyAllWindows()
+
+    def reset_track_variables(self):
+        self.current_track_assignments = {'lead': {}, 'follow': {}}
+        self.split_point = None
+        self.recursive_depth = 0
+        self.recursive_samples = []
+        self.current_samples = []
+        self.current_hover_index = None
+        self.is_hovering = False
 
     def show_main_collage(self):
         self.current_collage = self.create_collage(self.current_track_id, self.sample_frames)
