@@ -4,6 +4,8 @@ import numpy as np
 from pathlib import Path
 import tkinter as tk
 from collections import OrderedDict
+from matplotlib import cm
+import os
 
 class ManualReview:
     def __init__(self, input_video, detections_file, output_dir):
@@ -30,6 +32,10 @@ class ManualReview:
         self.dragging_keypoint = None
         self.frame_cache = OrderedDict()
         self.max_cache_size = 100
+        self.show_depth = False
+        self.depth_dir = os.path.join(output_dir, 'depth')
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         self.load_data()
         self.setup_gui()
@@ -138,9 +144,20 @@ class ManualReview:
                 cv2.putText(image, 'R', tuple(map(int, mid_point)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     def draw_frame(self):
-        frame = self.get_frame(self.current_frame).copy()  # Create a copy of the original frame
+        if self.show_depth:
+            depth_map = self.load_depth_map(self.current_frame)
+            if depth_map is not None:
+                frame = self.get_colored_depth_map(depth_map)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # Convert to BGR for OpenCV
+            else:
+                frame = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+        else:
+            frame = self.get_frame(self.current_frame)
+        
         if frame is None:
             return
+
+        frame = frame.copy()  # Create a copy to avoid modifying the original
 
         # Draw all poses from detections
         for detection in self.detections.get(str(self.current_frame), []):
@@ -303,6 +320,8 @@ class ManualReview:
                     self.hovered_pose = mirrored_pose
                     
                     self.draw_frame()
+            elif key == ord('d'):  # 'D' key to toggle depth map
+                self.show_depth = not self.show_depth
 
             if self.playing:
                 self.current_frame = min(self.current_frame + 1, self.frame_count - 1)
@@ -321,6 +340,37 @@ class ManualReview:
     def on_trackbar(self, value):
         self.current_frame = value
         self.draw_frame()
+
+    def load_depth_map(self, frame_num):
+        depth_file = os.path.join(self.depth_dir, f'{frame_num:06d}.npz')
+        if os.path.exists(depth_file):
+            with np.load(depth_file) as data:
+                keys = list(data.keys())
+                if keys:
+                    return data[keys[0]]
+                else:
+                    print(f"Warning: No data found in {depth_file}")
+                    return None
+        else:
+            print(f"Warning: Depth file not found: {depth_file}")
+            return None
+
+    def get_colored_depth_map(self, depth_map):
+        # Normalize depth map
+        depth_min = np.min(depth_map)
+        depth_max = np.max(depth_map)
+        normalized_depth = (depth_map - depth_min) / (depth_max - depth_min)
+
+        # Reverse the normalized depth
+        reversed_depth = 1 - normalized_depth
+
+        # Apply reversed magma colormap
+        colored_depth = (cm.magma(reversed_depth) * 255).astype(np.uint8)
+
+        # Resize to match frame dimensions
+        resized_depth = cv2.resize(colored_depth, (self.frame_width, self.frame_height), interpolation=cv2.INTER_LINEAR)
+
+        return resized_depth[:, :, :3]  # Return only RGB channels
 
 def main(input_video, detections_file, output_dir):
     reviewer = ManualReview(input_video, detections_file, output_dir)
