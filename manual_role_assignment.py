@@ -245,11 +245,13 @@ class ManualRoleAssignment:
         start_idx = person_frames.index(start_frame)
         end_idx = person_frames.index(end_frame)
         
-        if end_idx - start_idx <= 1:
-            return [start_frame, end_frame]
+        frames_between = person_frames[start_idx:end_idx+1]
         
-        step = (end_idx - start_idx) / 9
-        return [person_frames[int(end_idx - i * step)] for i in range(10)][::-1]
+        if len(frames_between) <= 10:
+            return frames_between
+        else:
+            step = (len(frames_between) - 1) / 9
+            return [frames_between[int(i * step)] for i in range(10)]
 
     def reset_recursive_state(self):
         self.recursive_depth = 0
@@ -325,20 +327,12 @@ class ManualRoleAssignment:
             if len(person_frames) <= self.num_samples:
                 sample_frames = person_frames
             else:
-                # Ensure we select exactly num_samples unique frames
-                step = max(1, (len(person_frames) - 1) // (self.num_samples - 1))
-                sample_frames = person_frames[::step][:self.num_samples]
-                
-                # If we have fewer than num_samples, add more frames
-                while len(sample_frames) < self.num_samples and len(sample_frames) < len(person_frames):
-                    for i in range(1, step):
-                        if len(sample_frames) >= self.num_samples:
-                            break
-                        additional_frames = person_frames[i::step]
-                        sample_frames.extend(additional_frames[:self.num_samples - len(sample_frames)])
-                
-                # Ensure the list is sorted and has no duplicates
-                sample_frames = sorted(list(set(sample_frames)))[:self.num_samples]
+                # Calculate the step size to evenly distribute samples
+                step = (len(person_frames) - 1) / (self.num_samples - 1)
+                sample_frames = [person_frames[int(i * step)] for i in range(self.num_samples)]
+            
+            # Ensure no duplicates
+            sample_frames = list(dict.fromkeys(sample_frames))
             
             self.sample_frames = sample_frames
             self.current_samples = self.sample_frames
@@ -373,9 +367,6 @@ class ManualRoleAssignment:
                 if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
                     self.reset_recursive_state()
                     self.update_main_collage()
-
-                # Update main collage on every iteration
-                self.update_main_collage()
 
         self.update_final_tracks()
         cv2.destroyAllWindows()
@@ -582,7 +573,10 @@ class ManualRoleAssignment:
         start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
         new_samples = self.get_recursive_samples(start_frame, end_frame)
 
-        # Always update samples and show detailed view, even if resolution hasn't changed
+        if len(new_samples) == len(self.current_samples):
+            # We've reached the finest resolution
+            return
+
         self.recursive_samples = new_samples
         self.current_samples = self.recursive_samples
         self.recursive_depth += 1
