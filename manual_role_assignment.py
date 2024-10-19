@@ -283,6 +283,7 @@ class ManualRoleAssignment:
                 return
 
             if self.is_hovering and self.current_hover_index is not None:
+                self.reset_detail_view()  # Reset the detail view state before handling a new detail view
                 self.handle_recursive_detail()
             else:
                 print("Click outside of any sample or button.")
@@ -294,6 +295,7 @@ class ManualRoleAssignment:
             cv2.resizeWindow("Detailed View", 1920, 1080)
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.detail_mouse_callback)
+            self.update_detailed_view()  # Add this line to ensure the view is updated
 
     def process_tracks(self):
         while self.current_track_id is not None:
@@ -330,6 +332,7 @@ class ManualRoleAssignment:
                     self.processed_track_ids.add(self.current_track_id)
                     self.current_track_id = self.find_next_unprocessed_track_id()
                     cv2.destroyWindow("Detailed View")
+                    self.reset_detail_view()  # Reset the detail view state when moving to the next track
                     self.clear_frame_cache()
                     gc.collect()  # Force garbage collection
                     break
@@ -342,7 +345,7 @@ class ManualRoleAssignment:
                     detailed_key = cv2.waitKey(1) & 0xFF
                     if detailed_key == 27 or detailed_key == ord('q'):  # ESC or 'q' key to quit detailed view
                         cv2.destroyWindow("Detailed View")
-                        self.reset_recursive_state()
+                        self.reset_detail_view()  # Reset the detail view state when closing the detailed view
                         self.update_main_collage()
                     elif detailed_key == 82:  # Up arrow
                         self.assign_role_with_hover('lead')
@@ -559,19 +562,20 @@ class ManualRoleAssignment:
         return deduplicated_tracks
 
     def handle_recursive_detail(self):
-        if self.recursive_depth >= self.max_recursive_depth:
+        if not self.is_hovering or self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
+            print(f"Invalid hover state in handle_recursive_detail. Is hovering: {self.is_hovering}, Hover index: {self.current_hover_index}")
             return
 
-        if not self.is_hovering or self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
-            print(f"Invalid hover state. Is hovering: {self.is_hovering}, Hover index: {self.current_hover_index}")
-            return
+        print(f"Handling recursive detail. Hover index: {self.current_hover_index}, Current samples: {self.current_samples}")
 
         end_frame = self.current_samples[self.current_hover_index]
         start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
         new_samples = self.get_recursive_samples(start_frame, end_frame)
 
-        if len(new_samples) == len(self.current_samples) and self.recursive_depth > 0:
-            # We've reached the finest resolution
+        print(f"New samples: {new_samples}")
+
+        if len(new_samples) <= 1:
+            print("Reached finest resolution")
             return
 
         self.recursive_samples = new_samples
@@ -581,28 +585,51 @@ class ManualRoleAssignment:
 
     def reset_detailed_view_state(self):
         self.recursive_samples = []
+        self.recursive_depth = 0
+        self.current_samples = self.sample_frames.copy()
         self.current_hover_index = None
         self.is_hovering = False
 
     def detail_mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
             layout = self.calculate_optimal_layout(len(self.current_samples))
+            old_hover_index = self.current_hover_index
+            self.current_hover_index = None
+            self.is_hovering = False
             for i, (lx, ly, lw, lh) in enumerate(layout):
                 if lx <= x < lx + lw and ly <= y < ly + lh:
                     self.current_hover_index = i
                     self.is_hovering = True
-                    return
-            self.is_hovering = False
-            self.current_hover_index = None
+                    break
+            
+            if self.current_hover_index != old_hover_index:
+                print(f"Mouse moved. Hover state: {self.is_hovering}, Hover index: {self.current_hover_index}")
+                self.update_detailed_view()
 
         elif event == cv2.EVENT_LBUTTONDOWN:
-            if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+            print(f"Mouse clicked. Hover state: {self.is_hovering}, Hover index: {self.current_hover_index}")
+            if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
                 self.handle_recursive_detail()
+            else:
+                print(f"Invalid hover state or click outside samples. Is hovering: {self.is_hovering}, Hover index: {self.current_hover_index}")
 
     def update_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
         if detailed_collage is not None:
+            # Highlight the hovered sample
+            if self.is_hovering and self.current_hover_index is not None:
+                layout = self.calculate_optimal_layout(len(self.current_samples))
+                x, y, w, h = layout[self.current_hover_index]
+                cv2.rectangle(detailed_collage, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
             cv2.imshow("Detailed View", detailed_collage)
+
+    def reset_detail_view(self):
+        self.recursive_samples = []
+        self.recursive_depth = 0
+        self.current_samples = self.sample_frames.copy()
+        self.current_hover_index = None
+        self.is_hovering = False
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
