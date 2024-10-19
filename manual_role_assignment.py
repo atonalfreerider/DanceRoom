@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 import tkinter as tk
+from collections import OrderedDict
 
 class ManualRoleAssignment:
     def __init__(self, input_video, detections_file, output_dir):
@@ -68,9 +69,9 @@ class ManualRoleAssignment:
         lead_file = self.output_dir / "lead.json"
         follow_file = self.output_dir / "follow.json"
 
-        # Remove empty lists before saving
-        lead_tracks = {k: v for k, v in self.lead_tracks.items() if v}
-        follow_tracks = {k: v for k, v in self.follow_tracks.items() if v}
+        # Sort and deduplicate before saving
+        lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
+        follow_tracks = self.sort_and_deduplicate_tracks(self.follow_tracks)
 
         with open(lead_file, 'w') as f:
             json.dump(lead_tracks, f, indent=2)
@@ -218,6 +219,9 @@ class ManualRoleAssignment:
             
             collage[y:y+h, x:x+w] = crop_resized
 
+            # Display frame number above each sample image
+            cv2.putText(collage, f"Frame: {frame_idx}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
         # Draw the "Save to JSON" button
         button_top = self.screen_height - self.button_height - 10
         button_left = self.screen_width - self.button_width - 10
@@ -226,6 +230,9 @@ class ManualRoleAssignment:
                       self.button_color, -1)
         cv2.putText(collage, "Save to JSON", (button_left + 10, button_top + 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
+
+        # Display current track ID at the top of the collage
+        cv2.putText(collage, f"Track ID: {track_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
         return collage
 
@@ -476,12 +483,20 @@ class ManualRoleAssignment:
                     self.follow_tracks[frame] = [detection]
                     self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id]
 
+        # Sort and deduplicate lead and follow tracks
+        self.lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
+        self.follow_tracks = self.sort_and_deduplicate_tracks(self.follow_tracks)
+
     def load_existing_assignments(self):
         if self.lead_file.exists() and self.follow_file.exists():
             with open(self.lead_file, 'r') as f:
                 self.lead_tracks = json.load(f)
             with open(self.follow_file, 'r') as f:
                 self.follow_tracks = json.load(f)
+
+            # Sort and deduplicate lead and follow tracks
+            self.lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
+            self.follow_tracks = self.sort_and_deduplicate_tracks(self.follow_tracks)
 
             # Find the last assigned track ID
             last_assigned_id = -1
@@ -495,7 +510,7 @@ class ManualRoleAssignment:
             self.last_assigned_track_id = last_assigned_id if last_assigned_id != -1 else None
 
     def find_next_track_id_after_last_assigned(self):
-        all_track_ids = self.find_all_track_ids()
+        all_track_ids = self.get_sorted_track_ids()
         if self.last_assigned_track_id is None:
             return all_track_ids[0] if all_track_ids else None
         
@@ -505,20 +520,23 @@ class ManualRoleAssignment:
         
         return None  # All tracks have been processed
 
-    def find_next_unprocessed_track_id(self):
-        all_track_ids = self.find_all_track_ids()
-        for track_id in all_track_ids:
-            if track_id not in self.processed_track_ids:
-                return track_id
-        return None  # All tracks have been processed
-
-    def find_all_track_ids(self):
+    def get_sorted_track_ids(self):
         all_track_ids = set()
         for detections in self.detections.values():
             for detection in detections:
                 if self.is_valid_detection(detection):
                     all_track_ids.add(detection['id'])
         return sorted(list(all_track_ids))
+
+    def find_next_unprocessed_track_id(self):
+        all_track_ids = self.get_sorted_track_ids()
+        for track_id in all_track_ids:
+            if track_id not in self.processed_track_ids:
+                return track_id
+        return None  # All tracks have been processed
+
+    def find_all_track_ids(self):
+        return self.get_sorted_track_ids()
 
     def get_frame(self, frame_idx):
         if frame_idx not in self.frame_cache:
@@ -533,6 +551,24 @@ class ManualRoleAssignment:
 
     def clear_frame_cache(self):
         self.frame_cache.clear()
+
+    def sort_and_deduplicate_tracks(self, tracks):
+        # Convert frame numbers to integers for proper sorting
+        sorted_tracks = OrderedDict(sorted(tracks.items(), key=lambda x: int(x[0])))
+        
+        # Deduplicate entries
+        deduplicated_tracks = OrderedDict()
+        for frame, detections in sorted_tracks.items():
+            unique_detections = []
+            seen_ids = set()
+            for detection in detections:
+                if detection['id'] not in seen_ids:
+                    unique_detections.append(detection)
+                    seen_ids.add(detection['id'])
+            if unique_detections:
+                deduplicated_tracks[frame] = unique_detections
+        
+        return deduplicated_tracks
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
