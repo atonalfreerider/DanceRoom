@@ -7,9 +7,6 @@ from collections import OrderedDict
 import gc
 import logging
 
-# Add this at the beginning of the file, after the imports
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-
 class ManualRoleAssignment:
     def __init__(self, input_video, detections_file, output_dir):
         self.input_video = input_video
@@ -60,7 +57,6 @@ class ManualRoleAssignment:
         
         gc.enable()  # Enable garbage collection
         self.detailed_view_active = False
-        logging.debug("ManualRoleAssignment initialized")
 
     @staticmethod
     def load_json(json_path):
@@ -279,7 +275,6 @@ class ManualRoleAssignment:
                     self.current_hover_index = i
                     self.is_hovering = True
                     break
-            logging.debug(f"Mouse moved. Hover state: {self.is_hovering}, Hover index: {self.current_hover_index}")
 
         elif event == cv2.EVENT_LBUTTONDOWN:
             # Check if the click is on the "Save to JSON" button
@@ -296,16 +291,12 @@ class ManualRoleAssignment:
                     self.is_hovering = True
                     break
             
-            logging.debug(f"Mouse clicked. Hover state: {self.is_hovering}, Hover index: {self.current_hover_index}")
-            
             if self.is_hovering and self.current_hover_index is not None:
-                hover_index = self.current_hover_index  # Store the hover index
-                self.reset_detail_view()  # Reset the detail view state before handling a new detail view
-                self.current_hover_index = hover_index  # Restore the hover index
-                self.is_hovering = True  # Ensure hovering is still true
+                hover_index = self.current_hover_index
+                self.reset_detail_view()
+                self.current_hover_index = hover_index
+                self.is_hovering = True
                 self.handle_recursive_detail()
-            else:
-                logging.debug("Click outside of any sample or button.")
 
     def show_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
@@ -315,13 +306,14 @@ class ManualRoleAssignment:
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.detail_mouse_callback)
             self.detailed_view_active = True
-            logging.debug("Detailed view shown")
-            self.update_detailed_view()
 
     def process_tracks(self):
         while self.current_track_id is not None:
             print(f"Processing track ID: {self.current_track_id}")
             self.reset_track_variables()
+            
+            # Reset current track assignments for the new track ID
+            self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
             
             person_frames = self.find_person_frames(self.current_track_id)
             
@@ -367,14 +359,12 @@ class ManualRoleAssignment:
                         self.detailed_view_active = False
                         self.reset_detail_view()
                         self.update_main_collage()
-                        logging.debug("Detailed view closed")
                     else:
                         detailed_key = cv2.waitKey(1) & 0xFF
                         if detailed_key == 27 or detailed_key == ord('q'):  # ESC or 'q' key to quit detailed view
                             cv2.destroyWindow("Detailed View")
                             self.reset_detail_view()
                             self.update_main_collage()
-                            logging.debug("Detailed view closed by key press")
                         elif detailed_key == 82:  # Up arrow
                             self.assign_role_with_hover('lead')
                             self.update_detailed_view()
@@ -590,19 +580,14 @@ class ManualRoleAssignment:
         return deduplicated_tracks
 
     def handle_recursive_detail(self):
-        logging.debug(f"Handling recursive detail. Hover index: {self.current_hover_index}, Current samples: {self.current_samples}")
         if not self.is_hovering or self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
-            logging.debug(f"Invalid hover state in handle_recursive_detail. Is hovering: {self.is_hovering}, Hover index: {self.current_hover_index}")
             return
 
         end_frame = self.current_samples[self.current_hover_index]
         start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
         new_samples = self.get_recursive_samples(start_frame, end_frame)
 
-        logging.debug(f"New samples: {new_samples}")
-
         if len(new_samples) <= 1:
-            logging.debug("Reached finest resolution")
             return
 
         self.recursive_samples = new_samples
@@ -618,7 +603,6 @@ class ManualRoleAssignment:
         self.is_hovering = False
 
     def detail_mouse_callback(self, event, x, y, flags, param):
-        logging.debug(f"Detail mouse event: {event}, x: {x}, y: {y}")
         if event == cv2.EVENT_MOUSEMOVE:
             layout = self.calculate_optimal_layout(len(self.current_samples))
             old_hover_index = self.current_hover_index
@@ -631,15 +615,11 @@ class ManualRoleAssignment:
                     break
             
             if self.current_hover_index != old_hover_index:
-                logging.debug(f"Mouse moved. Hover state: {self.is_hovering}, Hover index: {self.current_hover_index}")
                 self.update_detailed_view()
 
         elif event == cv2.EVENT_LBUTTONDOWN:
-            logging.debug(f"Mouse clicked. Hover state: {self.is_hovering}, Hover index: {self.current_hover_index}")
             if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
                 self.handle_recursive_detail()
-            else:
-                logging.debug(f"Invalid hover state or click outside samples. Is hovering: {self.is_hovering}, Hover index: {self.current_hover_index}")
 
     def update_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
@@ -657,18 +637,14 @@ class ManualRoleAssignment:
         self.recursive_depth = 0
         if not self.detailed_view_active:
             self.current_samples = self.sample_frames.copy()
-        # Don't reset hover state here
         self.detailed_view_active = False
-        logging.debug("Detail view reset")
 
 def main(input_video, detections_file, output_dir):
-    logging.debug("Starting manual role assignment")
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
     if assigner.current_track_id is None:
-        logging.info("All tracks have been processed. No manual assignment needed.")
+        print("All tracks have been processed. No manual assignment needed.")
     else:
         assigner.process_tracks()
-    logging.debug("Manual role assignment completed")
 
 if __name__ == "__main__":
     import argparse
