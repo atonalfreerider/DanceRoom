@@ -47,6 +47,8 @@ class ManualRoleAssignment:
         self.follow_file = self.output_dir / "follow.json"
         self.load_existing_assignments()
 
+        self.frame_cache = {}  # Add this line to create a frame cache
+
     @staticmethod
     def load_json(json_path):
         with open(json_path, 'r') as f:
@@ -168,9 +170,8 @@ class ManualRoleAssignment:
     def create_collage(self, track_id, sample_frames, is_detailed=False):
         crops = []
         for frame_idx in sample_frames:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = self.cap.read()
-            if not ret:
+            frame = self.get_frame(frame_idx)
+            if frame is None:
                 continue
 
             person = next((d for d in self.detections[str(frame_idx)] if d['id'] == track_id), None)
@@ -240,9 +241,10 @@ class ManualRoleAssignment:
     def reset_recursive_state(self):
         self.recursive_depth = 0
         self.recursive_samples = []
-        self.current_samples = self.sample_frames.copy()  # Use a copy to avoid reference issues
+        self.current_samples = self.sample_frames.copy()
         self.current_hover_index = None
         self.is_hovering = False
+        self.clear_frame_cache()  # Clear the frame cache when resetting recursive state
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -330,9 +332,10 @@ class ManualRoleAssignment:
                     self.assign_role_with_hover('follow')
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
-                    self.update_processed_track_ids()  # Add this line
+                    self.update_processed_track_ids()
                     self.current_track_id = self.find_next_track_id(self.current_track_id)
                     cv2.destroyWindow("Detailed View")
+                    self.clear_frame_cache()  # Clear the frame cache when moving to the next track
                     break
                 
                 # Check if detailed view is closed
@@ -382,14 +385,12 @@ class ManualRoleAssignment:
         
         for frame, detections in self.detections.items():
             frame_num = int(frame)
-            if frame_num >= start_frame:
-                for detection in detections:
-                    if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
+            for detection in detections:
+                if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
+                    if frame_num >= start_frame:
                         self.current_track_assignments[role][frame] = detection
                         self.current_track_assignments[other_role].pop(frame, None)
-            elif frame_num < start_frame:
-                for detection in detections:
-                    if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
+                    else:
                         if frame not in self.current_track_assignments[role] and frame not in self.current_track_assignments[other_role]:
                             self.current_track_assignments[other_role][frame] = detection
 
@@ -453,6 +454,20 @@ class ManualRoleAssignment:
             for frame, detections in getattr(self, f'{role}_tracks').items():
                 for detection in detections:
                     self.processed_track_ids.add(detection['id'])
+
+    def get_frame(self, frame_idx):
+        if frame_idx not in self.frame_cache:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame_cache[frame_idx] = frame
+            else:
+                return None
+
+        return self.frame_cache[frame_idx]
+
+    def clear_frame_cache(self):
+        self.frame_cache.clear()
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
