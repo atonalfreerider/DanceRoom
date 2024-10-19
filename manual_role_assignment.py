@@ -282,10 +282,10 @@ class ManualRoleAssignment:
                 self.save_json_files()
                 return
 
-            if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+            if self.is_hovering and self.current_hover_index is not None:
                 self.handle_recursive_detail()
             else:
-                print(f"Click outside valid sample area. Hover index: {self.current_hover_index}, Is hovering: {self.is_hovering}")
+                print("Click outside of any sample or button.")
 
     def show_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
@@ -562,12 +562,9 @@ class ManualRoleAssignment:
         if self.recursive_depth >= self.max_recursive_depth:
             return
 
-        if self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
-            print(f"Invalid hover index: {self.current_hover_index}")
-            return  # Exit if there's no valid hover index
-
-        # Reset the detailed view state before processing new samples
-        self.reset_detailed_view_state()
+        if not self.is_hovering or self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
+            print(f"Invalid hover state. Is hovering: {self.is_hovering}, Hover index: {self.current_hover_index}")
+            return
 
         end_frame = self.current_samples[self.current_hover_index]
         start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
