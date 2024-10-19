@@ -19,9 +19,7 @@ class DancerTracker:
         self.follow_file = os.path.join(output_dir, 'follow.json')
 
         self.men_women = self.load_json(self.men_women_file)
-        self.detections = self.load_json(self.detections_file)
-        self.lead = self.load_json(self.lead_file)
-        self.follow = self.load_json(self.follow_file)
+        self.detections = self.load_json(self.detections_file)        
 
     def process_video(self):
         self.detect_men_women()
