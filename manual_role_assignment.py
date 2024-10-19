@@ -223,8 +223,8 @@ class ManualRoleAssignment:
             
             collage[y:y+h, x:x+w] = crop_resized
 
-            # Display frame number above each sample image
-            cv2.putText(collage, f"Frame: {frame_idx}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # Display frame number above each sample image with larger text
+            cv2.putText(collage, f"Frame: {frame_idx}", (x, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         # Draw the "Save to JSON" button
         button_top = self.screen_height - self.button_height - 10
