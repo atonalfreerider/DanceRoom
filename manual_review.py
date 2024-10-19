@@ -240,6 +240,25 @@ class ManualReview:
                     self.lead[str(self.current_frame)] = [d for d in self.lead[str(self.current_frame)] if d['id'] != self.hovered_pose['id']]
             self.draw_frame()
 
+    def mirror_pose(self, pose):
+        # Define the pairs of keypoints to be swapped
+        swap_pairs = [
+            (1, 2),   # Left Eye, Right Eye
+            (3, 4),   # Left Ear, Right Ear
+            (5, 6),   # Left Shoulder, Right Shoulder
+            (7, 8),   # Left Elbow, Right Elbow
+            (9, 10),  # Left Wrist, Right Wrist
+            (11, 12), # Left Hip, Right Hip
+            (13, 14), # Left Knee, Right Knee
+            (15, 16)  # Left Ankle, Right Ankle
+        ]
+
+        for left, right in swap_pairs:
+            # Swap the positions and confidence values
+            pose['keypoints'][left], pose['keypoints'][right] = pose['keypoints'][right], pose['keypoints'][left]
+
+        return pose
+
     def run(self):
         while True:
             self.draw_frame()
@@ -261,6 +280,29 @@ class ManualReview:
                 # Get the current value from the trackbar
                 new_frame = cv2.getTrackbarPos('Frame', self.window_name)
                 self.current_frame = max(0, min(new_frame, self.frame_count - 1))
+            elif key == ord('r'):  # 'R' key for mirroring
+                if self.hovered_pose:
+                    # Mirror the hovered pose
+                    mirrored_pose = self.mirror_pose(self.hovered_pose.copy())
+                    
+                    # Update the pose in self.detections
+                    frame_detections = self.detections.get(str(self.current_frame), [])
+                    for i, detection in enumerate(frame_detections):
+                        if detection['id'] == self.hovered_pose['id']:
+                            frame_detections[i] = mirrored_pose
+                            break
+                    self.detections[str(self.current_frame)] = frame_detections
+                    
+                    # Update the pose in lead or follow if it's assigned
+                    if str(self.current_frame) in self.lead and self.lead[str(self.current_frame)] and self.lead[str(self.current_frame)][0]['id'] == self.hovered_pose['id']:
+                        self.lead[str(self.current_frame)] = [mirrored_pose]
+                    elif str(self.current_frame) in self.follow and self.follow[str(self.current_frame)] and self.follow[str(self.current_frame)][0]['id'] == self.hovered_pose['id']:
+                        self.follow[str(self.current_frame)] = [mirrored_pose]
+                    
+                    # Update the hovered pose
+                    self.hovered_pose = mirrored_pose
+                    
+                    self.draw_frame()
 
             if self.playing:
                 self.current_frame = min(self.current_frame + 1, self.frame_count - 1)
