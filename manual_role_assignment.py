@@ -70,6 +70,9 @@ class ManualRoleAssignment:
         self.root.withdraw()  # Hide the window initially
 
     def save_json_files(self):
+        # Update final tracks before saving
+        self.update_final_tracks()
+
         lead_file = self.output_dir / "lead.json"
         follow_file = self.output_dir / "follow.json"
 
@@ -86,6 +89,8 @@ class ManualRoleAssignment:
         cv2.putText(self.current_collage, "Saved!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.imshow(self.window_name, self.current_collage)
         cv2.waitKey(1000)  # Display "Saved!" message for 1 second
+        print(f"Saved lead tracks to {lead_file}")
+        print(f"Saved follow tracks to {follow_file}")
 
     def find_first_track_id(self):
         all_track_ids = set()
@@ -291,23 +296,7 @@ class ManualRoleAssignment:
                 else:
                     # Reset all roles for this track if clicked outside any sample at top level
                     self.reset_all_roles()
-                    self.show_main_collage()
-            else:
-                if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
-                    end_frame = self.recursive_samples[self.current_hover_index]
-                    start_frame = self.recursive_samples[max(0, self.current_hover_index - 1)]
-                    new_samples = self.get_recursive_samples(start_frame, end_frame)
-                    
-                    if len(new_samples) == 2 or self.recursive_depth >= self.max_recursive_depth:
-                        # We've reached the finest resolution or max depth
-                        self.recursive_samples = new_samples
-                        self.current_samples = self.recursive_samples
-                        self.show_detailed_view()
-                    else:
-                        self.recursive_samples = new_samples
-                        self.current_samples = self.recursive_samples
-                        self.recursive_depth += 1
-                        self.show_detailed_view()
+                    self.update_main_collage()
 
     def show_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
@@ -316,6 +305,24 @@ class ManualRoleAssignment:
             cv2.resizeWindow("Detailed View", 1920, 1080)
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.detail_mouse_callback)
+            
+            while True:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or key == ord('q'):  # ESC or 'q' key to quit detailed view
+                    break
+                elif key == 82:  # Up arrow
+                    self.assign_role_with_hover('lead')
+                    self.update_detailed_view()
+                elif key == 84:  # Down arrow
+                    self.assign_role_with_hover('follow')
+                    self.update_detailed_view()
+                
+                if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
+                    break
+        
+        cv2.destroyWindow("Detailed View")
+        self.reset_recursive_state()
+        self.update_main_collage()
 
     def process_tracks(self):
         while self.current_track_id is not None:
@@ -409,7 +416,6 @@ class ManualRoleAssignment:
                 # If not hovering in detailed view, do nothing
                 return
 
-        print(f"Assigned role: {role}, Current assignments: {self.current_track_assignments}")
         self.update_collage()
 
     def update_collage(self):
@@ -471,6 +477,17 @@ class ManualRoleAssignment:
                 else:
                     self.follow_tracks[frame] = [d for d in self.follow_tracks[frame] if d['id'] != self.current_track_id] + [detection]
                     self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id]
+
+        # Remove any frames for this track that are no longer assigned
+        all_assigned_frames = set(self.current_track_assignments['lead'].keys()) | set(self.current_track_assignments['follow'].keys())
+        for frame in list(self.lead_tracks.keys()):
+            self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id or frame in all_assigned_frames]
+        for frame in list(self.follow_tracks.keys()):
+            self.follow_tracks[frame] = [d for d in self.follow_tracks[frame] if d['id'] != self.current_track_id or frame in all_assigned_frames]
+
+        # Remove empty frames
+        self.lead_tracks = {k: v for k, v in self.lead_tracks.items() if v}
+        self.follow_tracks = {k: v for k, v in self.follow_tracks.items() if v}
 
         # Sort and deduplicate lead and follow tracks
         self.lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
@@ -581,32 +598,6 @@ class ManualRoleAssignment:
         self.current_samples = self.recursive_samples
         self.recursive_depth += 1
         self.show_detailed_view()
-
-    def show_detailed_view(self):
-        detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
-        if detailed_collage is not None:
-            cv2.namedWindow("Detailed View", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Detailed View", 1920, 1080)
-            cv2.imshow("Detailed View", detailed_collage)
-            cv2.setMouseCallback("Detailed View", self.detail_mouse_callback)
-            
-            while True:
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27 or key == ord('q'):  # ESC or 'q' key to quit detailed view
-                    break
-                elif key == 82:  # Up arrow
-                    self.assign_role_with_hover('lead')
-                    self.update_detailed_view()
-                elif key == 84:  # Down arrow
-                    self.assign_role_with_hover('follow')
-                    self.update_detailed_view()
-                
-                if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
-                    break
-        
-        cv2.destroyWindow("Detailed View")
-        self.reset_recursive_state()
-        self.update_main_collage()
 
     def detail_mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
