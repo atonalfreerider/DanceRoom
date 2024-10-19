@@ -30,8 +30,8 @@ def main(input_video, output_dir):
     #dancer_tracker = DancerTracker(input_video, output_dir)
     #dancer_tracker.process_video()
 
-    debug_video = DebugVideo(input_video, output_dir)
-    debug_video.generate_debug_video()
+    #debug_video = DebugVideo(input_video, output_dir)
+    #debug_video.generate_debug_video()
 
 
 if __name__ == "__main__":
