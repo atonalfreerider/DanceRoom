@@ -5,7 +5,6 @@ from pathlib import Path
 import tkinter as tk
 from collections import OrderedDict
 import gc
-import logging
 
 class ManualRoleAssignment:
     def __init__(self, input_video, detections_file, output_dir):
@@ -18,7 +17,7 @@ class ManualRoleAssignment:
         self.follow_tracks = {}
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.min_height_threshold = 0.5 * self.frame_height
-        self.current_track_id = self.find_first_track_id()
+        self.current_track_id = None
         self.window_name = "Manual Role Assignment"
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 1920, 1080)
@@ -48,9 +47,10 @@ class ManualRoleAssignment:
         self.processed_track_ids = set()
         self.lead_file = self.output_dir / "lead.json"
         self.follow_file = self.output_dir / "follow.json"
-        self.last_assigned_track_id = None  # Add this line
+        self.last_assigned_track_id = None
         self.load_existing_assignments()
-        self.current_track_id = self.find_next_track_id_after_last_assigned()
+        self.all_track_ids = self.find_all_track_ids()
+        self.current_track_id = self.find_next_track_id()
 
         self.frame_cache = OrderedDict()
         self.max_cache_size = 100  # Adjust this value based on available memory
@@ -94,21 +94,26 @@ class ManualRoleAssignment:
         print(f"Saved lead tracks to {lead_file}")
         print(f"Saved follow tracks to {follow_file}")
 
-    def find_first_track_id(self):
+    def find_all_track_ids(self):
         all_track_ids = set()
         for detections in self.detections.values():
             for detection in detections:
                 if self.is_valid_detection(detection):
                     all_track_ids.add(detection['id'])
-        return min(all_track_ids) if all_track_ids else None
+        return sorted(list(all_track_ids))
 
-    def find_next_track_id(self, current_id):
-        all_track_ids = set()
-        for detections in self.detections.values():
-            for detection in detections:
-                if detection['id'] > current_id and self.is_valid_detection(detection):
-                    all_track_ids.add(detection['id'])
-        return min(all_track_ids) if all_track_ids else None
+    def find_next_track_id(self):
+        if self.last_assigned_track_id is None:
+            # If there's no history, start with the first track_id
+            for track_id in self.all_track_ids:
+                if track_id not in self.processed_track_ids:
+                    return track_id
+        else:
+            # If there's history, find the next unprocessed track_id
+            for track_id in self.all_track_ids:
+                if track_id > self.last_assigned_track_id and track_id not in self.processed_track_ids:
+                    return track_id
+        return None
 
     def find_person_frames(self, track_id):
         person_frames = []
@@ -343,7 +348,8 @@ class ManualRoleAssignment:
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
                     self.processed_track_ids.add(self.current_track_id)
-                    self.current_track_id = self.find_next_unprocessed_track_id()
+                    self.last_assigned_track_id = self.current_track_id
+                    self.current_track_id = self.find_next_track_id()
                     cv2.destroyWindow("Detailed View")
                     self.reset_detail_view()
                     self.clear_frame_cache()
@@ -383,9 +389,7 @@ class ManualRoleAssignment:
         self.recursive_samples = []
         self.current_samples = []
         self.current_hover_index = None
-        self.is_hovering = False
-        # Do not reset current_track_assignments here
-        # self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
+        self.is_hovering = False        
 
     def update_main_collage(self):
         self.current_collage = self.create_collage(self.current_track_id, self.sample_frames)
@@ -514,35 +518,6 @@ class ManualRoleAssignment:
                         last_assigned_id = max(last_assigned_id, track_id)
             
             self.last_assigned_track_id = last_assigned_id if last_assigned_id != -1 else None
-
-    def find_next_track_id_after_last_assigned(self):
-        all_track_ids = self.get_sorted_track_ids()
-        if self.last_assigned_track_id is None:
-            return all_track_ids[0] if all_track_ids else None
-        
-        for track_id in all_track_ids:
-            if track_id > self.last_assigned_track_id:
-                return track_id
-        
-        return None  # All tracks have been processed
-
-    def get_sorted_track_ids(self):
-        all_track_ids = set()
-        for detections in self.detections.values():
-            for detection in detections:
-                if self.is_valid_detection(detection):
-                    all_track_ids.add(detection['id'])
-        return sorted(list(all_track_ids))
-
-    def find_next_unprocessed_track_id(self):
-        all_track_ids = self.get_sorted_track_ids()
-        for track_id in all_track_ids:
-            if track_id not in self.processed_track_ids:
-                return track_id
-        return None  # All tracks have been processed
-
-    def find_all_track_ids(self):
-        return self.get_sorted_track_ids()
 
     def get_frame(self, frame_idx):
         if frame_idx not in self.frame_cache:
