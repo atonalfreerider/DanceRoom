@@ -42,10 +42,12 @@ class ManualRoleAssignment:
         self.split_point = None
         self.is_hovering = False
 
-        self.processed_track_ids = set()  # Add this line
+        self.processed_track_ids = set()
         self.lead_file = self.output_dir / "lead.json"
         self.follow_file = self.output_dir / "follow.json"
+        self.last_assigned_track_id = None  # Add this line
         self.load_existing_assignments()
+        self.current_track_id = self.find_next_track_id_after_last_assigned()
 
         self.frame_cache = {}  # Add this line to create a frame cache
 
@@ -303,11 +305,8 @@ class ManualRoleAssignment:
             cv2.setMouseCallback("Detailed View", self.mouse_callback)
 
     def process_tracks(self):
-        if self.current_track_id is None:
-            print("All tracks have been processed. No manual assignment needed.")
-            return
-
         while self.current_track_id is not None:
+            print(f"Processing track ID: {self.current_track_id}")
             self.reset_track_variables()
             
             person_frames = self.find_person_frames(self.current_track_id)
@@ -332,12 +331,17 @@ class ManualRoleAssignment:
                     self.assign_role_with_hover('follow')
                 elif key == 83:  # Right arrow
                     self.update_final_tracks()
-                    self.update_processed_track_ids()
-                    self.current_track_id = self.find_next_track_id(self.current_track_id)
+                    self.processed_track_ids.add(self.current_track_id)
+                    self.current_track_id = self.find_next_unprocessed_track_id()
                     cv2.destroyWindow("Detailed View")
-                    self.clear_frame_cache()  # Clear the frame cache when moving to the next track
+                    self.clear_frame_cache()
                     break
                 
+                # Check if main window is closed
+                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    cv2.destroyAllWindows()
+                    return
+
                 # Check if detailed view is closed
                 if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
                     self.reset_recursive_state()
@@ -347,11 +351,7 @@ class ManualRoleAssignment:
         cv2.destroyAllWindows()
 
     def reset_track_variables(self):
-        # Only reset assignments for the current track
-        self.current_track_assignments = {
-            'lead': {k: v for k, v in self.current_track_assignments['lead'].items() if v['id'] == self.current_track_id},
-            'follow': {k: v for k, v in self.current_track_assignments['follow'].items() if v['id'] == self.current_track_id}
-        }
+        self.current_track_assignments = {'lead': {}, 'follow': {}}
         self.split_point = None
         self.recursive_depth = 0
         self.recursive_samples = []
@@ -365,34 +365,98 @@ class ManualRoleAssignment:
             cv2.imshow(self.window_name, self.current_collage)
 
     def assign_role_with_hover(self, role):
-        if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
-            if self.recursive_depth >= self.max_recursive_depth or len(self.current_samples) == 2:
-                self.split_point = self.current_samples[self.current_hover_index]
-                self.assign_role(role, self.split_point)
-                self.show_main_collage()
-                if self.recursive_depth > 0:
-                    self.show_detailed_view()
-                self.split_point = None
+        if self.recursive_depth == 0:
+            # On the main collage
+            if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+                # If hovering over a sample, assign from that sample onwards
+                start_frame = self.sample_frames[self.current_hover_index]
+                self.assign_role(role, start_frame)
+            else:
+                # If not hovering, assign to the entire track
+                self.assign_role(role, self.sample_frames[0])
         else:
-            # Assign role to entire track if not hovering or at coarse resolution
-            self.assign_role(role, self.current_samples[0])
-            self.show_main_collage()
-            if self.recursive_depth > 0:
-                self.show_detailed_view()
+            # In detailed view
+            if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+                start_frame = self.current_samples[self.current_hover_index]
+                self.assign_role(role, start_frame, is_detailed=True)
+            else:
+                # If not hovering in detailed view, do nothing
+                return
 
-    def assign_role(self, role, start_frame):
+        self.update_collage()
+
+    def update_collage(self):
+        if self.recursive_depth == 0:
+            self.show_main_collage()
+        else:
+            self.show_detailed_view()
+
+    def assign_role(self, role, start_frame, is_detailed=False):
         other_role = 'follow' if role == 'lead' else 'lead'
         
         for frame, detections in self.detections.items():
             frame_num = int(frame)
             for detection in detections:
                 if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
-                    if frame_num >= start_frame:
-                        self.current_track_assignments[role][frame] = detection
-                        self.current_track_assignments[other_role].pop(frame, None)
+                    if is_detailed:
+                        if frame_num == start_frame:
+                            # Assign the new role to the hovered frame
+                            self.current_track_assignments[role][frame] = detection
+                            self.current_track_assignments[other_role].pop(frame, None)
+                        elif frame_num > start_frame:
+                            # Assign the new role to all following frames
+                            self.current_track_assignments[role][frame] = detection
+                            self.current_track_assignments[other_role].pop(frame, None)
+                        else:
+                            # Assign the inverse role to all preceding unassigned frames
+                            if frame not in self.current_track_assignments[role] and frame not in self.current_track_assignments[other_role]:
+                                self.current_track_assignments[other_role][frame] = detection
                     else:
-                        if frame not in self.current_track_assignments[role] and frame not in self.current_track_assignments[other_role]:
-                            self.current_track_assignments[other_role][frame] = detection
+                        if frame_num >= start_frame:
+                            # Assign the new role from the start_frame onwards
+                            self.current_track_assignments[role][frame] = detection
+                            self.current_track_assignments[other_role].pop(frame, None)
+                        else:
+                            # For frames before start_frame, keep existing assignments
+                            if frame in self.current_track_assignments[role] or frame in self.current_track_assignments[other_role]:
+                                continue
+                            else:
+                                # If no existing assignment, assign to the current role
+                                self.current_track_assignments[role][frame] = detection
+
+        # Ensure continuity in assignments
+        self.ensure_role_continuity()
+
+    def ensure_role_continuity(self):
+        frames = sorted(list(self.detections.keys()), key=int)
+        last_role = None
+        last_frame = None
+        
+        for frame in frames:
+            if frame in self.current_track_assignments['lead']:
+                if last_role == 'follow' and last_frame is not None:
+                    # Fill gap between last_frame and current frame with last_role
+                    self.fill_gap(last_frame, int(frame), last_role)
+                last_role = 'lead'
+                last_frame = int(frame)
+            elif frame in self.current_track_assignments['follow']:
+                if last_role == 'lead' and last_frame is not None:
+                    # Fill gap between last_frame and current frame with last_role
+                    self.fill_gap(last_frame, int(frame), last_role)
+                last_role = 'follow'
+                last_frame = int(frame)
+        
+        # Fill any remaining frames after the last assignment
+        if last_role and last_frame:
+            self.fill_gap(last_frame, int(frames[-1]) + 1, last_role)
+
+    def fill_gap(self, start_frame, end_frame, role):
+        for frame in range(start_frame + 1, end_frame):
+            if str(frame) not in self.current_track_assignments['lead'] and str(frame) not in self.current_track_assignments['follow']:
+                for detection in self.detections[str(frame)]:
+                    if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
+                        self.current_track_assignments[role][str(frame)] = detection
+                        break
 
     def reset_all_roles(self):
         self.current_track_assignments = {'lead': {}, 'follow': {}}
@@ -419,27 +483,34 @@ class ManualRoleAssignment:
             with open(self.follow_file, 'r') as f:
                 self.follow_tracks = json.load(f)
 
+            # Find the last assigned track ID
             last_assigned_id = -1
-            # Assign roles from existing files to detections
             for role in ['lead', 'follow']:
                 for frame, detections in getattr(self, f'{role}_tracks').items():
                     for detection in detections:
                         track_id = detection['id']
-                        self.current_track_assignments[role][frame] = detection
                         self.processed_track_ids.add(track_id)
                         last_assigned_id = max(last_assigned_id, track_id)
+            
+            self.last_assigned_track_id = last_assigned_id if last_assigned_id != -1 else None
 
-            # Set the current_track_id to the first unassigned track after the last assigned one
-            all_track_ids = self.find_all_track_ids()
-            for track_id in all_track_ids:
-                if track_id > last_assigned_id and track_id not in self.processed_track_ids:
-                    self.current_track_id = track_id
-                    break
-            else:
-                self.current_track_id = None  # All tracks have been processed
+    def find_next_track_id_after_last_assigned(self):
+        all_track_ids = self.find_all_track_ids()
+        if self.last_assigned_track_id is None:
+            return all_track_ids[0] if all_track_ids else None
+        
+        for track_id in all_track_ids:
+            if track_id > self.last_assigned_track_id:
+                return track_id
+        
+        return None  # All tracks have been processed
 
-        else:
-            self.current_track_id = self.find_first_track_id()
+    def find_next_unprocessed_track_id(self):
+        all_track_ids = self.find_all_track_ids()
+        for track_id in all_track_ids:
+            if track_id not in self.processed_track_ids:
+                return track_id
+        return None  # All tracks have been processed
 
     def find_all_track_ids(self):
         all_track_ids = set()
@@ -448,12 +519,6 @@ class ManualRoleAssignment:
                 if self.is_valid_detection(detection):
                     all_track_ids.add(detection['id'])
         return sorted(list(all_track_ids))
-
-    def update_processed_track_ids(self):
-        for role in ['lead', 'follow']:
-            for frame, detections in getattr(self, f'{role}_tracks').items():
-                for detection in detections:
-                    self.processed_track_ids.add(detection['id'])
 
     def get_frame(self, frame_idx):
         if frame_idx not in self.frame_cache:
@@ -471,7 +536,10 @@ class ManualRoleAssignment:
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)
-    assigner.process_tracks()
+    if assigner.current_track_id is None:
+        print("All tracks have been processed. No manual assignment needed.")
+    else:
+        assigner.process_tracks()
 
 if __name__ == "__main__":
     import argparse
