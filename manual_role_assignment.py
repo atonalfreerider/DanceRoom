@@ -260,22 +260,19 @@ class ManualRoleAssignment:
 
     def reset_recursive_state(self):
         self.recursive_depth = 0
-        self.recursive_samples = []
+        self.reset_detailed_view_state()
         self.current_samples = self.sample_frames.copy()
-        self.current_hover_index = None
-        self.is_hovering = False
-        self.clear_frame_cache()  # Clear the frame cache when resetting recursive state
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
             layout = self.calculate_optimal_layout(len(self.current_samples))
+            self.current_hover_index = None
+            self.is_hovering = False
             for i, (lx, ly, lw, lh) in enumerate(layout):
                 if lx <= x < lx + lw and ly <= y < ly + lh:
                     self.current_hover_index = i
                     self.is_hovering = True
-                    return
-            self.is_hovering = False
-            self.current_hover_index = None
+                    break
 
         elif event == cv2.EVENT_LBUTTONDOWN:
             # Check if the click is on the "Save to JSON" button
@@ -285,18 +282,10 @@ class ManualRoleAssignment:
                 self.save_json_files()
                 return
 
-            if self.recursive_depth == 0:
-                if self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
-                    end_frame = self.current_samples[self.current_hover_index]
-                    start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
-                    self.recursive_samples = self.get_recursive_samples(start_frame, end_frame)
-                    self.recursive_depth += 1
-                    self.current_samples = self.recursive_samples
-                    self.show_detailed_view()
-                else:
-                    # Reset all roles for this track if clicked outside any sample at top level
-                    self.reset_all_roles()
-                    self.update_main_collage()
+            if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
+                self.handle_recursive_detail()
+            else:
+                print(f"Click outside valid sample area. Hover index: {self.current_hover_index}, Is hovering: {self.is_hovering}")
 
     def show_detailed_view(self):
         detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
@@ -305,24 +294,6 @@ class ManualRoleAssignment:
             cv2.resizeWindow("Detailed View", 1920, 1080)
             cv2.imshow("Detailed View", detailed_collage)
             cv2.setMouseCallback("Detailed View", self.detail_mouse_callback)
-            
-            while True:
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27 or key == ord('q'):  # ESC or 'q' key to quit detailed view
-                    break
-                elif key == 82:  # Up arrow
-                    self.assign_role_with_hover('lead')
-                    self.update_detailed_view()
-                elif key == 84:  # Down arrow
-                    self.assign_role_with_hover('follow')
-                    self.update_detailed_view()
-                
-                if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
-                    break
-        
-        cv2.destroyWindow("Detailed View")
-        self.reset_recursive_state()
-        self.update_main_collage()
 
     def process_tracks(self):
         while self.current_track_id is not None:
@@ -334,11 +305,9 @@ class ManualRoleAssignment:
             if len(person_frames) <= self.num_samples:
                 sample_frames = person_frames
             else:
-                # Calculate the step size to evenly distribute samples
                 step = (len(person_frames) - 1) / (self.num_samples - 1)
                 sample_frames = [person_frames[int(i * step)] for i in range(self.num_samples)]
             
-            # Ensure no duplicates
             sample_frames = list(dict.fromkeys(sample_frames))
             
             self.sample_frames = sample_frames
@@ -365,15 +334,24 @@ class ManualRoleAssignment:
                     gc.collect()  # Force garbage collection
                     break
                 
-                # Check if main window is closed
                 if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
                     cv2.destroyAllWindows()
                     return
 
-                # Check if detailed view is closed
-                if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) < 1:
-                    self.reset_recursive_state()
-                    self.update_main_collage()
+                if cv2.getWindowProperty("Detailed View", cv2.WND_PROP_VISIBLE) >= 1:
+                    detailed_key = cv2.waitKey(1) & 0xFF
+                    if detailed_key == 27 or detailed_key == ord('q'):  # ESC or 'q' key to quit detailed view
+                        cv2.destroyWindow("Detailed View")
+                        self.reset_recursive_state()
+                        self.update_main_collage()
+                    elif detailed_key == 82:  # Up arrow
+                        self.assign_role_with_hover('lead')
+                        self.update_detailed_view()
+                        self.update_main_collage()  # Update main collage to reflect changes
+                    elif detailed_key == 84:  # Down arrow
+                        self.assign_role_with_hover('follow')
+                        self.update_detailed_view()
+                        self.update_main_collage()  # Update main collage to reflect changes
 
         self.update_final_tracks()
         cv2.destroyAllWindows()
@@ -385,12 +363,8 @@ class ManualRoleAssignment:
         self.current_samples = []
         self.current_hover_index = None
         self.is_hovering = False
-        # Preserve current_track_assignments
-        self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
-        for role in ['lead', 'follow']:
-            for frame, detection in self.current_track_assignments[role].items():
-                if detection['id'] == self.current_track_id:
-                    self.current_track_assignments[role][frame] = detection
+        # Do not reset current_track_assignments here
+        # self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
 
     def update_main_collage(self):
         self.current_collage = self.create_collage(self.current_track_id, self.sample_frames)
@@ -417,12 +391,14 @@ class ManualRoleAssignment:
                 return
 
         self.update_collage()
+        self.update_main_collage()  # Always update the main collage
 
     def update_collage(self):
         if self.recursive_depth == 0:
             self.update_main_collage()
         else:
-            self.show_detailed_view()
+            self.update_detailed_view()
+            self.update_main_collage()  # Update main collage even when in detailed view
 
     def assign_role(self, role, start_frame, is_detailed=False):
         other_role = 'follow' if role == 'lead' else 'lead'
@@ -586,11 +562,18 @@ class ManualRoleAssignment:
         if self.recursive_depth >= self.max_recursive_depth:
             return
 
+        if self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
+            print(f"Invalid hover index: {self.current_hover_index}")
+            return  # Exit if there's no valid hover index
+
+        # Reset the detailed view state before processing new samples
+        self.reset_detailed_view_state()
+
         end_frame = self.current_samples[self.current_hover_index]
         start_frame = self.current_samples[max(0, self.current_hover_index - 1)]
         new_samples = self.get_recursive_samples(start_frame, end_frame)
 
-        if len(new_samples) == len(self.current_samples):
+        if len(new_samples) == len(self.current_samples) and self.recursive_depth > 0:
             # We've reached the finest resolution
             return
 
@@ -598,6 +581,11 @@ class ManualRoleAssignment:
         self.current_samples = self.recursive_samples
         self.recursive_depth += 1
         self.show_detailed_view()
+
+    def reset_detailed_view_state(self):
+        self.recursive_samples = []
+        self.current_hover_index = None
+        self.is_hovering = False
 
     def detail_mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
