@@ -5,6 +5,8 @@ from pathlib import Path
 import tkinter as tk
 from collections import OrderedDict
 import gc
+from pose_data_utils import PoseDataUtils
+
 
 class ManualRoleAssignment:
     def __init__(self, input_video, detections_file, output_dir):
@@ -13,55 +15,63 @@ class ManualRoleAssignment:
         self.output_dir = Path(output_dir)
         self.detections = self.load_json(detections_file)
         self.cap = cv2.VideoCapture(input_video)
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.lead_tracks = {}
         self.follow_tracks = {}
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.min_height_threshold = 0.5 * self.frame_height
-        self.current_track_id = None
+        self.current_track_id: int = -1
         self.window_name = "Manual Role Assignment"
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window_name, 1920, 1080)
         self.screen_width = 1920
         self.screen_height = 1080
-        self.num_samples = 24  # Adjust this number as needed
-        self.aspect_ratio = self.frame_height / int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.button_height = 40
         self.button_width = 150
-        self.button_color = (200, 200, 200)  # Light gray
-        self.button_text_color = (0, 0, 0)  # Black
-        cv2.setMouseCallback(self.window_name, self.mouse_callback)
-        self.setup_gui()
-        self.sample_frames = []
-        self.current_collage = None
-        self.recursive_samples = []
-        self.recursive_depth = 0
-        self.max_recursive_depth = 10  # Adjust this based on your video frame rate
-        self.lead_color = (255, 0, 0)  # Blue
-        self.follow_color = (255, 0, 255)  # Magenta
-        self.unassigned_color = (0, 255, 0)  # Green
+        self.button_color = (200, 200, 200)
+        self.button_text_color = (0, 0, 0)
+        self.lead_color = (0, 0, 255)  # Red for lead
+        self.follow_color = (255, 0, 255)  # Magenta for follow
+        self.unassigned_color = (0, 255, 0)  # Green for unassigned
+        self.num_samples = 24
+        self.aspect_ratio = self.frame_height / self.frame_width
         self.current_hover_index = None
-        self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
-        self.split_point = None
         self.is_hovering = False
-
+        self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
         self.processed_track_ids = set()
         self.lead_file = self.output_dir / "lead.json"
         self.follow_file = self.output_dir / "follow.json"
-        self.last_assigned_track_id = None
-        self.load_existing_assignments()
+        self.last_assigned_track_id: int = -1
         self.all_track_ids = self.find_all_track_ids()
-        self.current_track_id = self.find_next_track_id()
-
+        self.current_track_id: int = -1
         self.frame_cache = OrderedDict()
-        self.max_cache_size = 100  # Adjust this value based on available memory
-        
-        gc.enable()  # Enable garbage collection
+        self.max_cache_size = 100
         self.detailed_view_active = False
+        self.ui_overlay = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+        self.pose_utils = PoseDataUtils()
+        self.current_collage = None
+        self.collage_needs_update = True
+        self.sample_frames = []
+        self.current_samples = []
+        self.recursive_depth = 0
+        self.recursive_samples = []
+
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, self.screen_width, self.screen_height)
+        cv2.setMouseCallback(self.window_name, self.mouse_callback)
+
+        self.setup_gui()
+        self.load_existing_assignments()
+        self.draw_ui_overlay()
+        
+        gc.enable()
 
     @staticmethod
     def load_json(json_path):
         with open(json_path, 'r') as f:
-            return json.load(f)
+            detections = json.load(f)
+
+        # Convert all frame keys to integers
+        return {int(frame): data for frame, data in detections.items()}
 
     def setup_gui(self):
         self.root = tk.Tk()
@@ -72,27 +82,22 @@ class ManualRoleAssignment:
         self.root.withdraw()  # Hide the window initially
 
     def save_json_files(self):
-        # Update final tracks before saving
-        self.update_final_tracks()
+        try:
+            # Update final tracks with current assignments before saving
+            self.update_final_tracks()
 
-        lead_file = self.output_dir / "lead.json"
-        follow_file = self.output_dir / "follow.json"
+            # Use PoseDataUtils to save the tracks
+            self.pose_utils.save_poses(self.lead_tracks, self.frame_count, self.lead_file)
+            print(f"Saved lead tracks to {self.lead_file}")
 
-        # Sort and deduplicate before saving
-        lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
-        follow_tracks = self.sort_and_deduplicate_tracks(self.follow_tracks)
+            self.pose_utils.save_poses(self.follow_tracks, self.frame_count, self.follow_file)
+            print(f"Saved follow tracks to {self.follow_file}")
 
-        with open(lead_file, 'w') as f:
-            json.dump(lead_tracks, f, indent=2)
-        
-        with open(follow_file, 'w') as f:
-            json.dump(follow_tracks, f, indent=2)
+        except Exception as e:
+            print(f"Error during save: {str(e)}")
 
-        cv2.putText(self.current_collage, "Saved!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow(self.window_name, self.current_collage)
-        cv2.waitKey(1000)  # Display "Saved!" message for 1 second
-        print(f"Saved lead tracks to {lead_file}")
-        print(f"Saved follow tracks to {follow_file}")
+        # Don't reload assignments or update the collage after saving
+        self.collage_needs_update = True  # Just to refresh the UI to show save was successful
 
     def find_all_track_ids(self):
         all_track_ids = set()
@@ -102,17 +107,18 @@ class ManualRoleAssignment:
                     all_track_ids.add(detection['id'])
         return sorted(list(all_track_ids))
 
-    def find_next_track_id(self):
-        if self.last_assigned_track_id is None:
-            # If there's no history, start with the first track_id
-            for track_id in self.all_track_ids:
-                if track_id not in self.processed_track_ids:
-                    return track_id
-        else:
-            # If there's history, find the next unprocessed track_id
-            for track_id in self.all_track_ids:
-                if track_id > self.last_assigned_track_id and track_id not in self.processed_track_ids:
-                    return track_id
+    def find_next_unassigned_track_id(self):
+        start_index = 0
+        if self.last_assigned_track_id is not None:
+            try:
+                start_index = self.all_track_ids.index(self.last_assigned_track_id) + 1
+            except ValueError:
+                # If last_assigned_track_id is not in all_track_ids, start from the beginning
+                pass
+
+        for track_id in self.all_track_ids[start_index:]:
+            if track_id not in self.processed_track_ids:
+                return track_id
         return None
 
     def find_person_frames(self, track_id):
@@ -122,10 +128,6 @@ class ManualRoleAssignment:
                 if detection['id'] == track_id and self.is_valid_detection(detection):
                     person_frames.append(int(frame))
         return sorted(person_frames)
-
-    def get_person_crop(self, frame, bbox):
-        x1, y1, x2, y2 = map(int, bbox)
-        return frame[y1:y2, x1:x2]
 
     def is_valid_detection(self, detection):
         bbox = detection['bbox']
@@ -186,41 +188,49 @@ class ManualRoleAssignment:
         
         return layout
 
-    def create_collage(self, track_id, sample_frames, is_detailed=False):
+    def create_collage(self, track_id: int, sample_frames):
         crops = []
         for frame_idx in sample_frames:
             frame = self.get_frame(frame_idx)
             if frame is None:
                 continue
 
-            person = next((d for d in self.detections[str(frame_idx)] if d['id'] == track_id), None)
+            # Convert frame_idx to int and use it directly as the key
+            frame_idx_int = int(frame_idx)
+            if frame_idx_int not in self.detections:
+                print(f"Frame {frame_idx_int} not found in detections. Skipping.")
+                continue
+
+            # Get the person from detections for the given frame
+            person = next((d for d in self.detections[frame_idx_int] if d['id'] == track_id), None)
             if person is None:
                 continue
 
             bbox = person['bbox']
             x1, y1, x2, y2 = map(int, bbox)
-            crop = frame[y1:y2, x1:x2].copy()  # Create a copy to avoid reference to the whole frame
+            crop = frame[y1:y2, x1:x2].copy()
             crops.append((crop, frame_idx, person))
 
         if not crops:
             return None
 
-        # Calculate the optimal layout
         layout = self.calculate_optimal_layout(len(crops))
         collage = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
 
         for (crop, frame_idx, person), (x, y, w, h) in zip(crops, layout):
             crop_resized = cv2.resize(crop, (w, h), interpolation=cv2.INTER_AREA)
-            
-            # Determine the color based on the current track assignments
-            if str(frame_idx) in self.current_track_assignments['lead']:
+
+            frame_idx_int = int(frame_idx)
+
+            if frame_idx_int in self.current_track_assignments['lead'] and track_id == \
+                    int(self.current_track_assignments['lead'][frame_idx_int]['id']):
                 color = self.lead_color
-            elif str(frame_idx) in self.current_track_assignments['follow']:
+            elif frame_idx_int in self.current_track_assignments['follow'] and track_id == \
+                    int(self.current_track_assignments['follow'][frame_idx_int]['id']):
                 color = self.follow_color
             else:
                 color = self.unassigned_color
 
-            # Draw the pose on the resized crop
             keypoints = person['keypoints']
             bbox = person['bbox']
             adjusted_keypoints = [
@@ -232,23 +242,22 @@ class ManualRoleAssignment:
                 [kp[0] * scale_x, kp[1] * scale_y] + kp[2:] for kp in adjusted_keypoints
             ]
             self.draw_pose(crop_resized, scaled_keypoints, color)
-            
-            collage[y:y+h, x:x+w] = crop_resized
 
-            # Display frame number above each sample image with larger text
-            cv2.putText(collage, f"Frame: {frame_idx}", (x, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            collage[y:y + h, x:x + w] = crop_resized
+            cv2.putText(collage, f"Frame: {frame_idx_int}", (x, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255),
+                        2)
 
-        # Draw the "Save to JSON" button
         button_top = self.screen_height - self.button_height - 10
         button_left = self.screen_width - self.button_width - 10
-        cv2.rectangle(collage, (button_left, button_top), 
-                      (button_left + self.button_width, button_top + self.button_height), 
+        cv2.rectangle(collage, (button_left, button_top),
+                      (button_left + self.button_width, button_top + self.button_height),
                       self.button_color, -1)
-        cv2.putText(collage, "Save to JSON", (button_left + 10, button_top + 30), 
+        cv2.putText(collage, "Save to JSON", (button_left + 10, button_top + 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
 
-        # Display current track ID at the top of the collage
         cv2.putText(collage, f"Track ID: {track_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        collage = cv2.addWeighted(collage, 1, self.ui_overlay, 1, 0)
 
         return collage
 
@@ -256,19 +265,14 @@ class ManualRoleAssignment:
         person_frames = self.find_person_frames(self.current_track_id)
         start_idx = person_frames.index(start_frame)
         end_idx = person_frames.index(end_frame)
-        
-        frames_between = person_frames[start_idx:end_idx+1]
-        
+
+        frames_between = person_frames[start_idx:end_idx + 1]
+
         if len(frames_between) <= 10:
             return frames_between
         else:
             step = (len(frames_between) - 1) / 9
             return [frames_between[int(i * step)] for i in range(10)]
-
-    def reset_recursive_state(self):
-        self.recursive_depth = 0
-        self.reset_detailed_view_state()
-        self.current_samples = self.sample_frames.copy()
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -304,7 +308,7 @@ class ManualRoleAssignment:
                 self.handle_recursive_detail()
 
     def show_detailed_view(self):
-        detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
+        detailed_collage = self.create_collage(self.current_track_id, self.current_samples)
         if detailed_collage is not None:
             cv2.namedWindow("Detailed View", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("Detailed View", 1920, 1080)
@@ -314,12 +318,8 @@ class ManualRoleAssignment:
 
     def process_tracks(self):
         while self.current_track_id is not None:
-            print(f"Processing track ID: {self.current_track_id}")
             self.reset_track_variables()
-            
-            # Reset current track assignments for the new track ID
-            self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
-            
+
             person_frames = self.find_person_frames(self.current_track_id)
             
             if len(person_frames) <= self.num_samples:
@@ -328,33 +328,42 @@ class ManualRoleAssignment:
                 step = (len(person_frames) - 1) / (self.num_samples - 1)
                 sample_frames = [person_frames[int(i * step)] for i in range(self.num_samples)]
             
-            sample_frames = list(dict.fromkeys(sample_frames))
-            
-            self.sample_frames = sample_frames
+            self.sample_frames = list(dict.fromkeys(sample_frames))
             self.current_samples = self.sample_frames
-            self.update_main_collage()
+            self.collage_needs_update = True
 
             while True:
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:  # ESC key
-                    cv2.destroyAllWindows()
-                    return
-                elif key == 82:  # Up arrow
-                    self.assign_role_with_hover('lead')
+                if self.collage_needs_update:
                     self.update_main_collage()
-                elif key == 84:  # Down arrow
-                    self.assign_role_with_hover('follow')
-                    self.update_main_collage()
-                elif key == 83:  # Right arrow
-                    self.update_final_tracks()
-                    self.processed_track_ids.add(self.current_track_id)
-                    self.last_assigned_track_id = self.current_track_id
-                    self.current_track_id = self.find_next_track_id()
-                    cv2.destroyWindow("Detailed View")
-                    self.reset_detail_view()
-                    self.clear_frame_cache()
-                    gc.collect()
-                    break
+                    self.collage_needs_update = False
+
+                self.draw_frame()
+                key = cv2.waitKey(100) & 0xFF
+                
+                if key != 255:
+                    if key == 27:  # ESC key
+                        cv2.destroyAllWindows()
+                        return
+                    elif key == 82:  # Up arrow
+                        self.assign_role_with_hover('lead')
+                        self.collage_needs_update = True
+                    elif key == 84:  # Down arrow
+                        self.assign_role_with_hover('follow')
+                        self.collage_needs_update = True
+                    elif key == 83:  # Right arrow
+                        self.update_final_tracks()
+                        self.processed_track_ids.add(self.current_track_id)
+                        self.last_assigned_track_id = self.current_track_id
+                        old_track_id = self.current_track_id
+                        self.current_track_id = self.find_next_unassigned_track_id()
+                        cv2.destroyWindow("Detailed View")
+                        self.reset_detail_view()
+                        self.clear_frame_cache()
+                        gc.collect()
+                        self.collage_needs_update = True
+                        break
+                    elif key == ord('s'):  # 's' key for saving
+                        self.save_json_files()
                 
                 if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
                     cv2.destroyAllWindows()
@@ -366,22 +375,20 @@ class ManualRoleAssignment:
                         self.reset_detail_view()
                         self.update_main_collage()
                     else:
-                        detailed_key = cv2.waitKey(1) & 0xFF
-                        if detailed_key == 27 or detailed_key == ord('q'):  # ESC or 'q' key to quit detailed view
-                            cv2.destroyWindow("Detailed View")
-                            self.reset_detail_view()
-                            self.update_main_collage()
-                        elif detailed_key == 82:  # Up arrow
-                            self.assign_role_with_hover('lead')
-                            self.update_detailed_view()
-                            self.update_main_collage()
-                        elif detailed_key == 84:  # Down arrow
-                            self.assign_role_with_hover('follow')
-                            self.update_detailed_view()
-                            self.update_main_collage()
-
-        self.update_final_tracks()
-        cv2.destroyAllWindows()
+                        detailed_key = cv2.waitKey(100) & 0xFF  # Increased wait time to 100ms
+                        if detailed_key != 255:  # If a key was pressed in detailed view
+                            if detailed_key == 27 or detailed_key == ord('q'):  # ESC or 'q' key to quit detailed view
+                                cv2.destroyWindow("Detailed View")
+                                self.reset_detail_view()
+                                self.update_main_collage()
+                            elif detailed_key == 82:  # Up arrow
+                                self.assign_role_with_hover('lead')
+                                self.update_detailed_view()
+                                self.update_main_collage()
+                            elif detailed_key == 84:  # Down arrow
+                                self.assign_role_with_hover('follow')
+                                self.update_detailed_view()
+                                self.update_main_collage()
 
     def reset_track_variables(self):
         self.split_point = None
@@ -389,12 +396,15 @@ class ManualRoleAssignment:
         self.recursive_samples = []
         self.current_samples = []
         self.current_hover_index = None
-        self.is_hovering = False        
+        self.is_hovering = False
 
     def update_main_collage(self):
         self.current_collage = self.create_collage(self.current_track_id, self.sample_frames)
         if self.current_collage is not None:
             cv2.imshow(self.window_name, self.current_collage)
+            cv2.waitKey(1)
+        else:
+            print(f"Failed to create collage for track ID: {self.current_track_id}")
 
     def assign_role_with_hover(self, role):
         if self.recursive_depth == 0:
@@ -402,122 +412,115 @@ class ManualRoleAssignment:
             if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
                 # If hovering over a sample, assign from that sample onwards
                 start_frame = self.sample_frames[self.current_hover_index]
-                self.assign_role(role, start_frame, is_detailed=False)
+                self.assign_role(role, start_frame)
             else:
                 # If not hovering, assign to the entire track
-                self.assign_role(role, self.sample_frames[0], is_detailed=False)
+                self.assign_role(role, self.sample_frames[0])
         else:
             # In detailed view
             if self.is_hovering and self.current_hover_index is not None and self.current_hover_index < len(self.current_samples):
                 start_frame = self.current_samples[self.current_hover_index]
-                self.assign_role(role, start_frame, is_detailed=True)
+                self.assign_role(role, start_frame)
             else:
                 # If not hovering in detailed view, do nothing
                 return
 
+        print(f"Role {role} assigned, updating collage...")
         self.update_collage()
-        self.update_main_collage()  # Always update the main collage
+        self.update_main_collage()
+        self.collage_needs_update = True
 
     def update_collage(self):
         if self.recursive_depth == 0:
             self.update_main_collage()
         else:
             self.update_detailed_view()
-            self.update_main_collage()  # Update main collage even when in detailed view
+        self.update_main_collage()  # Always update the main collage
 
-    def assign_role(self, role, start_frame, is_detailed=False):
+    def assign_role(self, role, start_frame):
         other_role = 'follow' if role == 'lead' else 'lead'
-        
+
+        # Ensure frame keys are sorted and treated as integers
         frames = sorted(list(self.detections.keys()), key=int)
-        start_frame_str = str(start_frame)
-        start_index = frames.index(start_frame_str)
+        start_index = frames.index(start_frame)
 
         for i, frame in enumerate(frames):
-            for detection in self.detections[frame]:
+            frame_int = int(frame)
+
+            for detection in self.detections[frame_int]:
                 if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
                     if i >= start_index:
-                        self.current_track_assignments[role][frame] = detection
-                        self.current_track_assignments[other_role].pop(frame, None)
+                        # Assign the detection to the current role
+                        self.current_track_assignments[role][frame_int] = detection
+                        if self.current_track_assignments[other_role][frame_int]['id'] == detection['id']:
+                            # unassign
+                            self.current_track_assignments[other_role][frame_int] = PoseDataUtils.create_empty_pose()
                     else:
-                        if frame not in self.current_track_assignments[role] and frame not in self.current_track_assignments[other_role]:
-                            self.current_track_assignments[other_role][frame] = detection
+                        if self.current_track_assignments[other_role][frame_int]['id'] == -1 and self.is_role_defined_at(role, frame_int, detection['id']):
+                            # gap fill
+                            self.current_track_assignments[other_role][frame_int] = detection
 
-        self.ensure_role_continuity()
-
-    def ensure_role_continuity(self):
-        frames = sorted(list(self.detections.keys()), key=int)
-        last_role = None
-        
-        for frame in frames:
-            if frame in self.current_track_assignments['lead']:
-                last_role = 'lead'
-            elif frame in self.current_track_assignments['follow']:
-                last_role = 'follow'
-            
-            if last_role and frame not in self.current_track_assignments['lead'] and frame not in self.current_track_assignments['follow']:
-                # Fill in gaps with the last assigned role
-                for detection in self.detections[frame]:
-                    if detection['id'] == self.current_track_id and self.is_valid_detection(detection):
-                        self.current_track_assignments[last_role][frame] = detection
-                        break
-
-    def reset_all_roles(self):
-        self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
+    def is_role_defined_at(self, role, frame_int: int, track_to_check:int) -> bool:
+        # Check if the role is defined for the given frame
+        if frame_int in self.current_track_assignments[role]:
+            detection = self.current_track_assignments[role][frame_int]
+            # Check if the detection has a valid id (not an empty detection)
+            if detection['id'] != -1 and detection['id'] != track_to_check:  # Assuming -1 indicates an empty or unassigned detection
+                return True
+        return False
 
     def update_final_tracks(self):
         for role in ['lead', 'follow']:
             for frame, detection in self.current_track_assignments[role].items():
-                if frame not in self.lead_tracks:
-                    self.lead_tracks[frame] = []
-                if frame not in self.follow_tracks:
-                    self.follow_tracks[frame] = []
-                
                 if role == 'lead':
-                    self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id] + [detection]
-                    self.follow_tracks[frame] = [d for d in self.follow_tracks[frame] if d['id'] != self.current_track_id]
+                    self.lead_tracks[frame] = detection
                 else:
-                    self.follow_tracks[frame] = [d for d in self.follow_tracks[frame] if d['id'] != self.current_track_id] + [detection]
-                    self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id]
-
-        # Remove any frames for this track that are no longer assigned
-        all_assigned_frames = set(self.current_track_assignments['lead'].keys()) | set(self.current_track_assignments['follow'].keys())
-        for frame in list(self.lead_tracks.keys()):
-            self.lead_tracks[frame] = [d for d in self.lead_tracks[frame] if d['id'] != self.current_track_id or frame in all_assigned_frames]
-        for frame in list(self.follow_tracks.keys()):
-            self.follow_tracks[frame] = [d for d in self.follow_tracks[frame] if d['id'] != self.current_track_id or frame in all_assigned_frames]
-
-        # Remove empty frames
-        self.lead_tracks = {k: v for k, v in self.lead_tracks.items() if v}
-        self.follow_tracks = {k: v for k, v in self.follow_tracks.items() if v}
-
-        # Sort and deduplicate lead and follow tracks
-        self.lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
-        self.follow_tracks = self.sort_and_deduplicate_tracks(self.follow_tracks)
+                    self.follow_tracks[frame] = detection
 
         # Update processed_track_ids
         self.processed_track_ids.add(self.current_track_id)
 
     def load_existing_assignments(self):
-        if self.lead_file.exists() and self.follow_file.exists():
-            with open(self.lead_file, 'r') as f:
-                self.lead_tracks = json.load(f)
-            with open(self.follow_file, 'r') as f:
-                self.follow_tracks = json.load(f)
+        self.lead_file = self.output_dir / "lead.json"
+        self.follow_file = self.output_dir / "follow.json"
+        
+        if self.lead_file.exists():
+            self.lead_tracks = self.pose_utils.load_poses(self.lead_file)
+        else:
+            self.lead_tracks = OrderedDict()
+            for frame in range(self.frame_count):
+                self.lead_tracks[frame] = self.pose_utils.create_empty_pose()
+        
+        if self.follow_file.exists():
+            self.follow_tracks = self.pose_utils.load_poses(self.follow_file)
+        else:
+            self.follow_tracks = OrderedDict()
+            for frame in range(self.frame_count):
+                self.follow_tracks[frame] = self.pose_utils.create_empty_pose()
 
-            # Sort and deduplicate lead and follow tracks
-            self.lead_tracks = self.sort_and_deduplicate_tracks(self.lead_tracks)
-            self.follow_tracks = self.sort_and_deduplicate_tracks(self.follow_tracks)
+        # Reset processed_track_ids and current_track_assignments
+        self.processed_track_ids = set()
+        self.current_track_assignments = {'lead': OrderedDict(), 'follow': OrderedDict()}
+        
+        for role, tracks in [('lead', self.lead_tracks), ('follow', self.follow_tracks)]:
+            for frame, frame_detection in tracks.items():
+                if frame not in self.current_track_assignments[role]:
+                    self.current_track_assignments[role][frame] = PoseDataUtils.create_empty_pose()
+                track_id = int(frame_detection['id'])
+                if track_id == -1:
+                    continue
+                self.processed_track_ids.add(track_id)
+                self.current_track_assignments[role][frame] = frame_detection
 
-            # Find the last assigned track ID
-            last_assigned_id = -1
-            for role in ['lead', 'follow']:
-                for frame, detections in getattr(self, f'{role}_tracks').items():
-                    for detection in detections:
-                        track_id = detection['id']
-                        self.processed_track_ids.add(track_id)
-                        last_assigned_id = max(last_assigned_id, track_id)
-            
-            self.last_assigned_track_id = last_assigned_id if last_assigned_id != -1 else None
+        # Set the last_assigned_track_id to the highest track ID that was assigned
+        self.last_assigned_track_id = max(self.processed_track_ids) if self.processed_track_ids else None
+
+        print(f"Loaded {len(self.processed_track_ids)} fully processed track IDs")
+        print(f"Last assigned track ID: {self.last_assigned_track_id}")
+
+        # Set the current_track_id to the next unassigned track
+        self.current_track_id = self.find_next_unassigned_track_id()
+        print(f"Starting with track ID: {self.current_track_id}")
 
     def get_frame(self, frame_idx):
         if frame_idx not in self.frame_cache:
@@ -529,33 +532,15 @@ class ManualRoleAssignment:
                 self.frame_cache[frame_idx] = frame
             else:
                 return None
-
         return self.frame_cache[frame_idx]
 
     def clear_frame_cache(self):
         self.frame_cache.clear()
         gc.collect()  # Force garbage collection
 
-    def sort_and_deduplicate_tracks(self, tracks):
-        # Convert frame numbers to integers for proper sorting
-        sorted_tracks = OrderedDict(sorted(tracks.items(), key=lambda x: int(x[0])))
-        
-        # Deduplicate entries
-        deduplicated_tracks = OrderedDict()
-        for frame, detections in sorted_tracks.items():
-            unique_detections = []
-            seen_ids = set()
-            for detection in detections:
-                if detection['id'] not in seen_ids:
-                    unique_detections.append(detection)
-                    seen_ids.add(detection['id'])
-            if unique_detections:
-                deduplicated_tracks[frame] = unique_detections
-        
-        return deduplicated_tracks
-
     def handle_recursive_detail(self):
-        if not self.is_hovering or self.current_hover_index is None or self.current_hover_index >= len(self.current_samples):
+        if not self.is_hovering or self.current_hover_index is None or self.current_hover_index >= len(
+                self.current_samples):
             return
 
         end_frame = self.current_samples[self.current_hover_index]
@@ -597,7 +582,7 @@ class ManualRoleAssignment:
                 self.handle_recursive_detail()
 
     def update_detailed_view(self):
-        detailed_collage = self.create_collage(self.current_track_id, self.current_samples, is_detailed=True)
+        detailed_collage = self.create_collage(self.current_track_id, self.current_samples)
         if detailed_collage is not None:
             # Highlight the hovered sample
             if self.is_hovering and self.current_hover_index is not None:
@@ -613,6 +598,25 @@ class ManualRoleAssignment:
         if not self.detailed_view_active:
             self.current_samples = self.sample_frames.copy()
         self.detailed_view_active = False
+
+    def draw_frame(self):
+        if self.current_collage is not None:
+            cv2.imshow(self.window_name, self.current_collage)
+
+    def draw_ui_overlay(self):
+        # Clear the previous overlay
+        self.ui_overlay.fill(0)
+        
+        # Calculate button position based on frame dimensions
+        button_top = self.frame_height - self.button_height - 10
+        button_left = self.frame_width - self.button_width - 10
+        
+        # Draw the "Save to JSON" button on the UI overlay
+        cv2.rectangle(self.ui_overlay, (button_left, button_top), 
+                      (button_left + self.button_width, button_top + self.button_height), 
+                      self.button_color, -1)
+        cv2.putText(self.ui_overlay, "Save to JSON", (button_left + 10, button_top + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
 
 def main(input_video, detections_file, output_dir):
     assigner = ManualRoleAssignment(input_video, detections_file, output_dir)

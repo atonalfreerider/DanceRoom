@@ -39,14 +39,14 @@ class DebugVideo:
             # Draw lead and follow
             lead_pose = lead_track.get(str(frame_count))
             if lead_pose:
-                lead_keypoints = lead_pose[0]['keypoints']
+                lead_keypoints = lead_pose['keypoints']
                 self.draw_pose(frame, lead_keypoints, (0, 0, 255), is_lead_or_follow=True)  # Red for lead
                 cv2.putText(frame, "LEAD", (int(lead_keypoints[0][0]), int(lead_keypoints[0][1]) - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             follow_pose = follow_track.get(str(frame_count))
             if follow_pose:
-                follow_keypoints = follow_pose[0]['keypoints']
+                follow_keypoints = follow_pose['keypoints']
                 self.draw_pose(frame, follow_keypoints, (255, 192, 203), is_lead_or_follow=True)  # Pink for follow
                 cv2.putText(frame, "FOLLOW", (int(follow_keypoints[0][0]), int(follow_keypoints[0][1]) - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)

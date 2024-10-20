@@ -6,6 +6,8 @@ import tkinter as tk
 from collections import OrderedDict
 from matplotlib import cm
 import os
+from pose_data_utils import PoseDataUtils
+import time
 
 class ManualReview:
     def __init__(self, input_video, detections_file, output_dir):
@@ -36,6 +38,10 @@ class ManualReview:
         self.depth_dir = os.path.join(output_dir, 'depth')
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.ui_overlay = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+        self.draw_ui_overlay()
+
+        self.pose_utils = PoseDataUtils()
 
         self.load_data()
         self.setup_gui()
@@ -44,6 +50,8 @@ class ManualReview:
         cv2.resizeWindow(self.window_name, self.screen_width, self.screen_height)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
         self.create_trackbar()
+
+        self.save_requested = False
 
     def load_data(self):
         # Load detections
@@ -63,14 +71,8 @@ class ManualReview:
         # Load lead and follow
         self.lead_file = self.output_dir / "lead.json"
         self.follow_file = self.output_dir / "follow.json"
-        self.lead = self.load_json(self.lead_file)
-        self.follow = self.load_json(self.follow_file)
-
-    def load_json(self, file_path):
-        if file_path.exists():
-            with open(file_path, 'r') as f:
-                return json.load(f)
-        return {}
+        self.lead = self.pose_utils.load_poses(self.lead_file) if self.lead_file.exists() else {}
+        self.follow = self.pose_utils.load_poses(self.follow_file) if self.follow_file.exists() else {}
 
     def setup_gui(self):
         self.root = tk.Tk()
@@ -81,20 +83,35 @@ class ManualReview:
         self.root.withdraw()  # Hide the window initially
 
     def save_json_files(self):
-        # Save lead.json and follow.json
-        with open(self.lead_file, 'w') as f:
-            json.dump(self.lead, f, indent=2)
-        with open(self.follow_file, 'w') as f:
-            json.dump(self.follow, f, indent=2)
+        self._save_json_files()
 
-        # Save detections-modified.json
-        detections_modified_file = self.output_dir / "detections-modified.json"
-        with open(detections_modified_file, 'w') as f:
-            json.dump(self.detections, f, indent=2)
+    def _save_json_files(self):
+        try:
+            # Check if lead and follow data are not empty before saving
+            if self.lead:
+                self.pose_utils.save_poses(self.lead, self.frame_count, self.lead_file)
+                print(f"Saved lead tracks to {self.lead_file}")
+            else:
+                print("Lead data is empty. Skipping save for lead.")
 
-        print(f"Saved lead tracks to {self.lead_file}")
-        print(f"Saved follow tracks to {self.follow_file}")
-        print(f"Saved modified detections to {detections_modified_file}")
+            if self.follow:
+                self.pose_utils.save_poses(self.follow, self.frame_count, self.follow_file)
+                print(f"Saved follow tracks to {self.follow_file}")
+            else:
+                print("Follow data is empty. Skipping save for follow.")
+
+            # Save detections-modified.json
+            if self.detections:
+                detections_modified_file = self.output_dir / "detections-modified.json"
+                with open(detections_modified_file, 'w') as f:
+                    json.dump(self.detections, f, indent=2)
+                print(f"Saved modified detections to {detections_modified_file}")
+            else:
+                print("Detections data is empty. Skipping save for detections.")
+
+            print("Save completed successfully")
+        except Exception as e:
+            print(f"Error during save: {str(e)}")
 
     def get_frame(self, frame_idx):
         if frame_idx not in self.frame_cache:
@@ -163,10 +180,10 @@ class ManualReview:
         for detection in self.detections.get(str(self.current_frame), []):
             color = self.unassigned_color
             is_lead_or_follow = False
-            if str(self.current_frame) in self.lead and self.lead[str(self.current_frame)] and detection['id'] == self.lead[str(self.current_frame)][0]['id']:
+            if self.current_frame in self.lead and self.lead[self.current_frame] and detection['id'] == self.lead[self.current_frame]['id']:
                 color = self.lead_color
                 is_lead_or_follow = True
-            elif str(self.current_frame) in self.follow and self.follow[str(self.current_frame)] and detection['id'] == self.follow[str(self.current_frame)][0]['id']:
+            elif self.current_frame in self.follow and self.follow[self.current_frame] and detection['id'] == self.follow[self.current_frame]['id']:
                 color = self.follow_color
                 is_lead_or_follow = True
             self.draw_pose(frame, detection['keypoints'], color, is_lead_or_follow)
@@ -176,8 +193,8 @@ class ManualReview:
             self.draw_pose(frame, self.hovered_pose['keypoints'], self.hover_color)
 
         # Draw the "Save to JSON" button
-        button_top = self.screen_height - self.button_height - 10
-        button_left = self.screen_width - self.button_width - 10
+        button_top = self.frame_height - self.button_height - 10
+        button_left = self.frame_width - self.button_width - 10
         cv2.rectangle(frame, (button_left, button_top), 
                       (button_left + self.button_width, button_top + self.button_height), 
                       self.button_color, -1)
@@ -190,6 +207,13 @@ class ManualReview:
 
         # Update trackbar position
         cv2.setTrackbarPos('Frame', self.window_name, self.current_frame)
+
+        # Add the UI overlay to the frame
+        frame = cv2.addWeighted(frame, 1, self.ui_overlay, 1, 0)
+
+        # Resize the frame to fit the screen if necessary
+        if frame.shape[0] != self.screen_height or frame.shape[1] != self.screen_width:
+            frame = cv2.resize(frame, (self.screen_width, self.screen_height))
 
         cv2.imshow(self.window_name, frame)
 
@@ -209,6 +233,11 @@ class ManualReview:
         return (closest_pose, closest_keypoint_index)
 
     def mouse_callback(self, event, x, y, flags, param):
+        # Adjust mouse coordinates if frame is resized
+        frame_height, frame_width = self.frame_height, self.frame_width
+        x = int(x * (frame_width / self.screen_width))
+        y = int(y * (frame_height / self.screen_height))
+
         if event == cv2.EVENT_MOUSEMOVE:
             old_hovered_pose = self.hovered_pose
             self.hovered_pose, _ = self.find_closest_keypoint(x, y)
@@ -233,8 +262,8 @@ class ManualReview:
 
         elif event == cv2.EVENT_LBUTTONDOWN:
             # Check if the click is on the "Save to JSON" button
-            button_top = self.screen_height - self.button_height - 10
-            button_left = self.screen_width - self.button_width - 10
+            button_top = self.frame_height - self.button_height - 10
+            button_left = self.frame_width - self.button_width - 10
             if button_left <= x <= button_left + self.button_width and button_top <= y <= button_top + self.button_height:
                 self.save_json_files()
                 return
@@ -247,14 +276,25 @@ class ManualReview:
 
     def assign_role(self, role):
         if self.hovered_pose:
+            current_frame_int = int(self.current_frame)  # Ensure the frame key is an integer
+
             if role == 'lead':
-                self.lead[str(self.current_frame)] = [self.hovered_pose]
-                if str(self.current_frame) in self.follow:
-                    self.follow[str(self.current_frame)] = [d for d in self.follow[str(self.current_frame)] if d['id'] != self.hovered_pose['id']]
+                # Assign the hovered_pose to the lead role for the current frame
+                self.lead[current_frame_int] = self.hovered_pose
+
+                # If the current frame is also in follow, remove the pose with the same id from follow
+                if current_frame_int in self.follow and self.follow[current_frame_int]['id'] == self.hovered_pose['id']:
+                    del self.follow[current_frame_int]  # Remove the pose from follow if it matches
+
             elif role == 'follow':
-                self.follow[str(self.current_frame)] = [self.hovered_pose]
-                if str(self.current_frame) in self.lead:
-                    self.lead[str(self.current_frame)] = [d for d in self.lead[str(self.current_frame)] if d['id'] != self.hovered_pose['id']]
+                # Assign the hovered_pose to the follow role for the current frame
+                self.follow[current_frame_int] = self.hovered_pose
+
+                # If the current frame is also in lead, remove the pose with the same id from lead
+                if current_frame_int in self.lead and self.lead[current_frame_int]['id'] == self.hovered_pose['id']:
+                    del self.lead[current_frame_int]  # Remove the pose from lead if it matches
+
+            # Redraw the frame after the assignment
             self.draw_frame()
 
     def mirror_pose(self, pose):
@@ -277,62 +317,73 @@ class ManualReview:
         return pose
 
     def run(self):
-        while True:
-            self.draw_frame()
-            key = cv2.waitKey(1) & 0xFF
+        try:
+            while True:
+                self.draw_frame()
+                key = cv2.waitKey(1) & 0xFF
 
-            if key == ord('q'):
-                break
-            elif key == 32:  # Spacebar
-                self.playing = not self.playing
-            elif key == 83:  # Right arrow
-                self.current_frame = min(self.current_frame + 1, self.frame_count - 1)
-            elif key == 81:  # Left arrow
-                self.current_frame = max(self.current_frame - 1, 0)
-            elif key == ord('1'):
-                self.assign_role('lead')
-            elif key == ord('2'):
-                self.assign_role('follow')
-            elif key == 13:  # Enter key
-                # Get the current value from the trackbar
-                new_frame = cv2.getTrackbarPos('Frame', self.window_name)
-                self.current_frame = max(0, min(new_frame, self.frame_count - 1))
-            elif key == ord('r'):  # 'R' key for mirroring
-                if self.hovered_pose:
-                    # Mirror the hovered pose
-                    mirrored_pose = self.mirror_pose(self.hovered_pose.copy())
-                    
-                    # Update the pose in self.detections
-                    frame_detections = self.detections.get(str(self.current_frame), [])
-                    for i, detection in enumerate(frame_detections):
-                        if detection['id'] == self.hovered_pose['id']:
-                            frame_detections[i] = mirrored_pose
-                            break
-                    self.detections[str(self.current_frame)] = frame_detections
-                    
-                    # Update the pose in lead or follow if it's assigned
-                    if str(self.current_frame) in self.lead and self.lead[str(self.current_frame)] and self.lead[str(self.current_frame)][0]['id'] == self.hovered_pose['id']:
-                        self.lead[str(self.current_frame)] = [mirrored_pose]
-                    elif str(self.current_frame) in self.follow and self.follow[str(self.current_frame)] and self.follow[str(self.current_frame)][0]['id'] == self.hovered_pose['id']:
-                        self.follow[str(self.current_frame)] = [mirrored_pose]
-                    
-                    # Update the hovered pose
-                    self.hovered_pose = mirrored_pose
-                    
-                    self.draw_frame()
-            elif key == ord('d'):  # 'D' key to toggle depth map
-                self.show_depth = not self.show_depth
+                if key == ord('q'):
+                    break
+                elif key == 32:  # Spacebar
+                    self.playing = not self.playing
+                elif key == 83:  # Right arrow
+                    self.current_frame = min(self.current_frame + 1, self.frame_count - 1)
+                elif key == 81:  # Left arrow
+                    self.current_frame = max(self.current_frame - 1, 0)
+                elif key == ord('1'):
+                    self.assign_role('lead')
+                elif key == ord('2'):
+                    self.assign_role('follow')
+                elif key == 13:  # Enter key
+                    # Get the current value from the trackbar
+                    new_frame = cv2.getTrackbarPos('Frame', self.window_name)
+                    self.current_frame = max(0, min(new_frame, self.frame_count - 1))
+                elif key == ord('r'):  # 'R' key for mirroring
+                    if self.hovered_pose:
+                        # Mirror the hovered pose
+                        mirrored_pose = self.mirror_pose(self.hovered_pose.copy())
+                        
+                        # Update the pose in self.detections
+                        frame_detections = self.detections.get(str(self.current_frame), [])
+                        for i, detection in enumerate(frame_detections):
+                            if detection['id'] == self.hovered_pose['id']:
+                                frame_detections[i] = mirrored_pose
+                                break
+                        self.detections[str(self.current_frame)] = frame_detections
+                        
+                        # Update the pose in lead or follow if it's assigned
+                        if self.current_frame in self.lead and self.lead[self.current_frame] and self.lead[self.current_frame]['id'] == self.hovered_pose['id']:
+                            self.lead[self.current_frame] = mirrored_pose
+                        elif self.current_frame in self.follow and self.follow[self.current_frame] and self.follow[self.current_frame]['id'] == self.hovered_pose['id']:
+                            self.follow[self.current_frame] = mirrored_pose
+                        
+                        # Update the hovered pose
+                        self.hovered_pose = mirrored_pose
+                        
+                        self.draw_frame()
+                elif key == ord('d'):  # 'D' key to toggle depth map
+                    self.show_depth = not self.show_depth
+                elif key == ord('0'):  # '0' key to unassign the hovered pose
+                    self.unassign_pose()
+                elif key == 0x70:  # F1 key (0x70 is the scan code for F1)
+                    self.save_json_files()
 
-            if self.playing:
-                self.current_frame = min(self.current_frame + 1, self.frame_count - 1)
-                if self.current_frame == self.frame_count - 1:
-                    self.playing = False
+                if self.playing:
+                    self.current_frame = min(self.current_frame + 1, self.frame_count - 1)
+                    if self.current_frame == self.frame_count - 1:
+                        self.playing = False
 
-            if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
-                break
+                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
 
-        self.cap.release()
-        cv2.destroyAllWindows()
+                # Add a small delay to reduce CPU usage
+                time.sleep(0.01)
+
+        except KeyboardInterrupt:
+            print("Manual review interrupted. Cleaning up...")
+        finally:
+            self.cap.release()
+            cv2.destroyAllWindows()
 
     def create_trackbar(self):
         cv2.createTrackbar('Frame', self.window_name, 0, self.frame_count - 1, self.on_trackbar)
@@ -371,6 +422,33 @@ class ManualReview:
         resized_depth = cv2.resize(colored_depth, (self.frame_width, self.frame_height), interpolation=cv2.INTER_LINEAR)
 
         return resized_depth[:, :, :3]  # Return only RGB channels
+
+    def draw_ui_overlay(self):
+        # Clear the previous overlay
+        self.ui_overlay.fill(0)
+        
+        # Calculate button position based on frame dimensions
+        button_top = self.frame_height - self.button_height - 10
+        button_left = self.frame_width - self.button_width - 10
+        
+        # Draw the "Save to JSON" button on the UI overlay
+        cv2.rectangle(self.ui_overlay, (button_left, button_top), 
+                      (button_left + self.button_width, button_top + self.button_height), 
+                      self.button_color, -1)
+        cv2.putText(self.ui_overlay, "Save to JSON", (button_left + 10, button_top + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.button_text_color, 2)
+
+    def unassign_pose(self):
+        if self.hovered_pose:
+            if self.current_frame in self.lead:
+                self.lead[self.current_frame] = [d for d in self.lead[self.current_frame] if d['id'] != self.hovered_pose['id']][0] #TODO
+                if not self.lead[self.current_frame]:
+                    del self.lead[self.current_frame]
+            if self.current_frame in self.follow:
+                self.follow[self.current_frame] = [d for d in self.follow[self.current_frame] if d['id'] != self.hovered_pose['id']][0] #TODO
+                if not self.follow[self.current_frame]:
+                    del self.follow[self.current_frame]
+            self.draw_frame()
 
 def main(input_video, detections_file, output_dir):
     reviewer = ManualReview(input_video, detections_file, output_dir)
