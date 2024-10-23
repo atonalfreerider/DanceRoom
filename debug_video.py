@@ -10,8 +10,12 @@ class DebugVideo:
         self.output_dir = output_dir
         self.lead_file = os.path.join(output_dir, 'lead.json')
         self.follow_file = os.path.join(output_dir, 'follow.json')
+        self.lead_smoothed_file = os.path.join(output_dir, 'lead_smoothed.json')
+        self.follow_smoothed_file = os.path.join(output_dir, 'follow_smoothed.json')
         self.lead = self.load_json(self.lead_file)
         self.follow = self.load_json(self.follow_file)
+        self.lead_smoothed = self.load_json(self.lead_smoothed_file)
+        self.follow_smoothed = self.load_json(self.follow_smoothed_file)
 
 
     def generate_debug_video(self):
@@ -26,30 +30,38 @@ class DebugVideo:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(debug_video_path, fourcc, fps, (frame_width, frame_height))
 
-        # Load tracked sequences
-        lead_track = self.load_json(self.lead_file)
-        follow_track = self.load_json(self.follow_file)
-
-
         for frame_count in range(total_frames):
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Draw lead and follow
-            lead_pose = lead_track.get(str(frame_count))
-            if lead_pose:
-                lead_keypoints = lead_pose['keypoints']
+            frame_str = str(frame_count)
+
+            # Draw original lead and follow
+            if frame_str in self.lead and self.lead[frame_str]:
+                lead_keypoints = self.lead[frame_str]['keypoints']
                 self.draw_pose(frame, lead_keypoints, (0, 0, 255), is_lead_or_follow=True)  # Red for lead
                 cv2.putText(frame, "LEAD", (int(lead_keypoints[0][0]), int(lead_keypoints[0][1]) - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            follow_pose = follow_track.get(str(frame_count))
-            if follow_pose:
-                follow_keypoints = follow_pose['keypoints']
-                self.draw_pose(frame, follow_keypoints, (255, 192, 203), is_lead_or_follow=True)  # Pink for follow
+            if frame_str in self.follow and self.follow[frame_str]:
+                follow_keypoints = self.follow[frame_str]['keypoints']
+                self.draw_pose(frame, follow_keypoints, (255, 0, 255), is_lead_or_follow=True)  # Magenta for follow
                 cv2.putText(frame, "FOLLOW", (int(follow_keypoints[0][0]), int(follow_keypoints[0][1]) - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+
+            # Draw smoothed lead and follow
+            if frame_str in self.lead_smoothed and self.lead_smoothed[frame_str]:
+                lead_smoothed_keypoints = self.lead_smoothed[frame_str]['keypoints']
+                self.draw_pose(frame, lead_smoothed_keypoints, (0, 255, 255), is_lead_or_follow=True)  # Cyan for smoothed lead
+                cv2.putText(frame, "LEAD (Smoothed)", (int(lead_smoothed_keypoints[0][0]), int(lead_smoothed_keypoints[0][1]) - 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            if frame_str in self.follow_smoothed and self.follow_smoothed[frame_str]:
+                follow_smoothed_keypoints = self.follow_smoothed[frame_str]['keypoints']
+                self.draw_pose(frame, follow_smoothed_keypoints, (255, 255, 0), is_lead_or_follow=True)  # Yellow for smoothed follow
+                cv2.putText(frame, "FOLLOW (Smoothed)", (int(follow_smoothed_keypoints[0][0]), int(follow_smoothed_keypoints[0][1]) - 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
             out.write(frame)
 
