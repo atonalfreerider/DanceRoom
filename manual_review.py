@@ -363,6 +363,8 @@ class ManualReview:
                         self.draw_frame()
                 elif key == ord('d'):  # 'D' key to toggle depth map
                     self.show_depth = not self.show_depth
+                elif key == ord('t'):  # 'T' key to add new T-pose
+                    self.add_t_pose()
                 elif key == ord('0'):  # '0' key to unassign the hovered pose
                     self.unassign_pose()
                 elif key == 0x70:  # F1 key (0x70 is the scan code for F1)
@@ -449,6 +451,50 @@ class ManualReview:
                 if not self.follow[self.current_frame]:
                     del self.follow[self.current_frame]
             self.draw_frame()
+
+    def create_t_pose(self):
+        # Create a T-pose in the center of the frame, facing the camera
+        center_x, center_y = self.frame_width // 2, self.frame_height // 2
+        t_pose = {
+            'id': -1,  # Use -1 as the track ID for manually added poses
+            'bbox': [0, 0, 0, 0],  # Zeroed-out bounding box [x, y, width, height]
+            'confidence': 0,  # Zero confidence score
+            'keypoints': [
+                [center_x, center_y - 100, 1],  # Nose
+                [center_x - 15, center_y - 110, 1],  # Left Eye
+                [center_x + 15, center_y - 110, 1],  # Right Eye
+                [center_x - 25, center_y - 105, 1],  # Left Ear
+                [center_x + 25, center_y - 105, 1],  # Right Ear
+                [center_x - 80, center_y - 50, 1],  # Left Shoulder
+                [center_x + 80, center_y - 50, 1],  # Right Shoulder
+                [center_x - 150, center_y - 50, 1],  # Left Elbow
+                [center_x + 150, center_y - 50, 1],  # Right Elbow
+                [center_x - 220, center_y - 50, 1],  # Left Wrist
+                [center_x + 220, center_y - 50, 1],  # Right Wrist
+                [center_x - 30, center_y + 100, 1],  # Left Hip
+                [center_x + 30, center_y + 100, 1],  # Right Hip
+                [center_x - 30, center_y + 200, 1],  # Left Knee
+                [center_x + 30, center_y + 200, 1],  # Right Knee
+                [center_x - 30, center_y + 300, 1],  # Left Ankle
+                [center_x + 30, center_y + 300, 1],  # Right Ankle
+            ]
+        }
+        return t_pose
+
+    def add_t_pose(self):
+        new_pose = self.create_t_pose()
+        
+        # Add the new pose to the detections for the current frame
+        frame_key = str(self.current_frame)
+        if frame_key not in self.detections:
+            self.detections[frame_key] = []
+        self.detections[frame_key].append(new_pose)
+        
+        # Set the new pose as the hovered pose
+        self.hovered_pose = new_pose
+        
+        # Redraw the frame
+        self.draw_frame()
 
 def main(input_video, detections_file, output_dir):
     reviewer = ManualReview(input_video, detections_file, output_dir)
