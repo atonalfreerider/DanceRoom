@@ -442,14 +442,18 @@ class ManualReview:
 
     def unassign_pose(self):
         if self.hovered_pose:
-            if self.current_frame in self.lead:
-                self.lead[self.current_frame] = [d for d in self.lead[self.current_frame] if d['id'] != self.hovered_pose['id']][0] #TODO
-                if not self.lead[self.current_frame]:
-                    del self.lead[self.current_frame]
-            if self.current_frame in self.follow:
-                self.follow[self.current_frame] = [d for d in self.follow[self.current_frame] if d['id'] != self.hovered_pose['id']][0] #TODO
-                if not self.follow[self.current_frame]:
-                    del self.follow[self.current_frame]
+            # Check if the hovered pose is assigned as lead
+            if (self.current_frame in self.lead and
+                    self.lead[self.current_frame] and
+                    self.lead[self.current_frame]['id'] == self.hovered_pose['id']):
+                del self.lead[self.current_frame]
+
+            # Check if the hovered pose is assigned as follow
+            if (self.current_frame in self.follow and
+                    self.follow[self.current_frame] and
+                    self.follow[self.current_frame]['id'] == self.hovered_pose['id']):
+                del self.follow[self.current_frame]
+
             self.draw_frame()
 
     def create_t_pose(self):
