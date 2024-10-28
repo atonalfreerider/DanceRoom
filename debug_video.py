@@ -2,6 +2,7 @@ import os
 import cv2
 import json
 import numpy as np
+from tqdm import tqdm
 
 
 class DebugVideo:
@@ -30,31 +31,32 @@ class DebugVideo:
         lead_track = self.load_json(self.lead_file)
         follow_track = self.load_json(self.follow_file)
 
+        # Use tqdm to track progress
+        with tqdm(total=total_frames, desc="Generating debug video") as pbar:
+            for frame_count in range(total_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-        for frame_count in range(total_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
+                # Draw lead and follow
+                lead_pose = lead_track.get(str(frame_count))
+                if lead_pose:
+                    lead_keypoints = lead_pose['keypoints']
+                    self.draw_pose(frame, lead_keypoints, (0, 0, 255), is_lead_or_follow=True)  # Red for lead
+                    cv2.putText(frame, "LEAD", (int(lead_keypoints[0][0]), int(lead_keypoints[0][1]) - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # Draw lead and follow
-            lead_pose = lead_track.get(str(frame_count))
-            if lead_pose:
-                lead_keypoints = lead_pose['keypoints']
-                self.draw_pose(frame, lead_keypoints, (0, 0, 255), is_lead_or_follow=True)  # Red for lead
-                cv2.putText(frame, "LEAD", (int(lead_keypoints[0][0]), int(lead_keypoints[0][1]) - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                follow_pose = follow_track.get(str(frame_count))
+                if follow_pose:
+                    follow_keypoints = follow_pose['keypoints']
+                    self.draw_pose(frame, follow_keypoints, (255, 192, 203), is_lead_or_follow=True)  # Pink for follow
+                    cv2.putText(frame, "FOLLOW", (int(follow_keypoints[0][0]), int(follow_keypoints[0][1]) - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)
 
-            follow_pose = follow_track.get(str(frame_count))
-            if follow_pose:
-                follow_keypoints = follow_pose['keypoints']
-                self.draw_pose(frame, follow_keypoints, (255, 192, 203), is_lead_or_follow=True)  # Pink for follow
-                cv2.putText(frame, "FOLLOW", (int(follow_keypoints[0][0]), int(follow_keypoints[0][1]) - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)
+                out.write(frame)
 
-            out.write(frame)
-
-            if frame_count % 100 == 0:
-                print(f"Processed {frame_count}/{total_frames} frames for debug video")
+                # Update progress bar
+                pbar.update(1)
 
         cap.release()
         out.release()

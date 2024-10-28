@@ -75,7 +75,7 @@ class YOLOPose:
         pbar.close()
 
     def process_frame(self, model, frame, frame_index):
-        results = model.track(frame, stream=True, persist=True)
+        results = model.track(frame, stream=True, persist=True, verbose=False)
 
         frame_detections = []
 
