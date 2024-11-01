@@ -25,7 +25,7 @@ def main(input_video, output_dir):
     dancer_tracker.process_video()
     
     # Create debug video (optional)
-    dancer_tracker.create_debug_video()
+    #dancer_tracker.create_debug_video()
 
     # manually assign roles to tracked persons
     #manual_assigner = ManualRoleAssignment(input_video, output_dir + "/detections.json", output_dir)

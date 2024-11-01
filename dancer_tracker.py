@@ -1,49 +1,99 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import json
 import os
 import tqdm
+from deepface import DeepFace
+import shutil
+from collections import defaultdict
+import random
 
-# uses YOLOv11 to detect gender of figures and track them
+# uses DeepFace to find self-similar faces and gender
 class DancerTracker:
     def __init__(self, input_path, output_dir):
         self.input_path = input_path
         self.output_dir = output_dir
         self.depth_dir = os.path.join(output_dir, 'depth')
         self.figure_mask_dir = os.path.join(output_dir, 'figure-masks')
+        
+        # New directories for face processing
+        self.faces_dir = os.path.join(output_dir, 'faces')
+        self.person_dirs = os.path.join(output_dir, 'person_clusters')
+        self.lead_faces_dir = os.path.join(output_dir, 'lead_faces')
+        self.follow_faces_dir = os.path.join(output_dir, 'follow_faces')
+        
+        # Create necessary directories
+        for dir_path in [self.faces_dir, self.person_dirs, 
+                        self.lead_faces_dir, self.follow_faces_dir]:
+            os.makedirs(dir_path, exist_ok=True)
 
         self.detections_file = os.path.join(output_dir, 'detections.json')
         self.lead_file = os.path.join(output_dir, 'lead.json')
         self.follow_file = os.path.join(output_dir, 'follow.json')
 
         self.detections = self.load_json(self.detections_file)
-
-        # Initialize YOLO model for gender detection
-        self.gender_model = YOLO('/home/john/Desktop/3DPose/DanceRoom/yolo11x-man-woman2.pt')  # You'll need to specify your gender model path
-
-        self.gender_detections_file = os.path.join(output_dir, 'gender-detections.json')
-        self.debug_video_path = os.path.join(output_dir, 'gender-debug.mp4')
-
-        # Get input video framerate
+        
+        # Get input video dimensions
         cap = cv2.VideoCapture(input_path)
-        self.fps = cap.get(cv2.CAP_PROP_FPS)
+        self.frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         cap.release()
 
-        self.gender_confidence_threshold = 0.85  # 85% confidence threshold
-
     def process_video(self):
-        self.track_lead_and_follow()
-        print("lead and follow tracked")
+        # Check if faces directory already has crops
+        existing_faces = os.listdir(self.faces_dir)
+        if not existing_faces:
+            self.extract_face_crops()
+        else:
+            print(f"Found {len(existing_faces)} existing face crops, skipping extraction...")
+        
+        self.cluster_faces()
+        self.analyze_gender_and_assign_roles()
+        self.interpolate_missing_assignments()
+        print("Lead and follow tracked using DeepFace approach")
+
+    def extract_face_crops(self):
+        """Step 1: Extract face crops from poses meeting height threshold"""
+        print("Extracting face crops...")
+        frame_count = len(os.listdir(self.figure_mask_dir))
+        min_height_threshold = 0.6 * self.frame_height
+        
+        for frame_num in tqdm.tqdm(range(frame_count)):
+            frame_path = os.path.join(self.figure_mask_dir, f"{frame_num:06d}.png")
+            if not os.path.exists(frame_path):
+                continue
+                
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                continue
+                
+            detections_in_frame = self.detections.get(frame_num, [])
+            
+            for detection in detections_in_frame:
+                bbox = detection['bbox']
+                height = bbox[3] - bbox[1]
+                
+                if height >= min_height_threshold:
+                    head_bbox = self.get_head_bbox(detection['keypoints'])
+                    if head_bbox:
+                        x1, y1, x2, y2 = head_bbox
+                        head_img = frame[y1:y2, x1:x2]
+                        
+                        if head_img.size > 0:
+                            output_path = os.path.join(
+                                self.faces_dir, 
+                                f"{frame_num:06d}-{detection['id']}.jpg"
+                            )
+                            cv2.imwrite(output_path, head_img)
 
     def get_head_bbox(self, keypoints, padding_percent=0.25):
-        """Extract head bounding box from keypoints with padding"""
+        """Extract square head bounding box from keypoints with padding"""
         # Get head keypoints (nose, eyes, ears) - indices 0-4
         head_points = keypoints[:5]
         
         # Filter out low confidence or missing points (0,0 coordinates)
-        valid_points = [point for point in head_points 
-                       if point[2] > 0.3 and (point[0] != 0 or point[1] != 0)]
+        valid_points = [point for point in head_points
+                        if point[2] > 0.3 and (point[0] != 0 or point[1] != 0)]
         
         if not valid_points:
             return None
@@ -55,287 +105,278 @@ class DancerTracker:
         x_min, y_min = np.min(points, axis=0)
         x_max, y_max = np.max(points, axis=0)
         
-        # Add padding
+        # Calculate center point
+        center_x = (x_min + x_max) / 2
+        center_y = (y_min + y_max) / 2
+        
+        # Get the larger dimension for square crop
         width = x_max - x_min
         height = y_max - y_min
-        padding_x = width * padding_percent
-        padding_y = height * padding_percent
+        size = max(width, height)
         
-        x_min = max(0, x_min - padding_x)
-        y_min = max(0, y_min - padding_y)
-        x_max = x_max + padding_x
-        y_max = y_max + padding_y
+        # Add padding
+        size_with_padding = size * (1 + 2 * padding_percent)
+        half_size = size_with_padding / 2
+        
+        # Calculate square bounds from center
+        x_min = center_x - half_size
+        x_max = center_x + half_size
+        y_min = center_y - half_size
+        y_max = center_y + half_size
+        
+        # Ensure bounds are within frame
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(self.frame_width, x_max)
+        y_max = min(self.frame_height, y_max)
         
         return [int(x_min), int(y_min), int(x_max), int(y_max)]
 
-    def track_lead_and_follow(self):
-        frame_count = len(os.listdir(self.figure_mask_dir))
-        pbar = tqdm.tqdm(total=frame_count, desc="Tracking poses")
-
-        # Try to load cached gender detections
-        gender_detections = {}
-        if os.path.exists(self.gender_detections_file):
-            print("Loading cached gender detections...")
-            with open(self.gender_detections_file, 'r') as f:
-                gender_detections = json.load(f)
+    def cluster_faces(self):
+        """Steps 2-3: Cluster faces using DeepFace.find"""
+        print("Clustering faces...")
+        face_files = os.listdir(self.faces_dir)
         
-        # First pass: Collect gender votes for each detection
-        track_gender_votes = {}
-        track_frames = {}
+        if not face_files:
+            raise Exception("No face crops found!")
+            
+        # Take a random sample of faces to analyze
+        sample_size = min(20, len(face_files))
+        sample_faces = random.sample(face_files, sample_size)
         
-        for frame_num in range(frame_count):
-            mask_path = os.path.join(self.figure_mask_dir, f"{frame_num:06d}.png")
-            if not os.path.exists(mask_path):
+        clusters = defaultdict(list)
+        processed_files = set()
+        
+        for face_file in tqdm.tqdm(sample_faces):
+            if face_file in processed_files:
                 continue
                 
-            frame_img = cv2.imread(mask_path)
-            if frame_img is None:
-                continue
-            
-            frame_height, frame_width = frame_img.shape[:2]
-            detections_in_frame = self.detections.get(frame_num, [])
-            
-            # Initialize frame in gender_detections if not exists
-            if str(frame_num) not in gender_detections:
-                gender_detections[str(frame_num)] = []
-
-            for detection in detections_in_frame:
-                track_id = detection.get('id')
-                
-                if track_id not in track_frames:
-                    track_frames[track_id] = set()
-                track_frames[track_id].add(frame_num)
-                
-                # Check if we have cached gender detection
-                cached_gender = next(
-                    (g for g in gender_detections.get(str(frame_num), [])
-                     if g['id'] == track_id),
-                    None
+            try:
+                img_path = os.path.join(self.faces_dir, face_file)
+                dfs = DeepFace.find(
+                    img_path=img_path,
+                    db_path=self.faces_dir,
+                    enforce_detection=False
                 )
                 
-                if cached_gender:
-                    gender = cached_gender['gender']
-                    confidence = cached_gender['confidence']
-                else:
-                    # Default values
-                    gender = 'unknown'
-                    confidence = 0
+                if dfs[0].empty:
+                    continue
                     
-                    # Perform gender detection
-                    keypoints = detection.get('keypoints', [])
-                    head_bbox = self.get_head_bbox(keypoints)
-                    
-                    if head_bbox is not None:
-                        x1, y1, x2, y2 = head_bbox
-                        x1 = max(0, min(x1, frame_width - 1))
-                        y1 = max(0, min(y1, frame_height - 1))
-                        x2 = max(0, min(x2, frame_width))
-                        y2 = max(0, min(y2, frame_height))
-                        
-                        if x2 > x1 and y2 > y1:
-                            try:
-                                head_img = frame_img[y1:y2, x1:x2]
-                                if head_img.size > 0 and head_img.shape[0] > 0 and head_img.shape[1] > 0:
-                                    results = self.gender_model(head_img, verbose=False)
-                                    if results and len(results) > 0 and len(results[0].boxes) > 0:
-                                        gender_class = int(results[0].boxes[0].cls.cpu().numpy())
-                                        confidence = float(results[0].boxes[0].conf.cpu().numpy())
-                                        
-                                        # Only assign gender if confidence is above threshold
-                                        if confidence >= self.gender_confidence_threshold:
-                                            gender = 'male' if gender_class == 0 else 'female'
-                                        else:
-                                            gender = 'unknown'
-                                            confidence = 0
-                            except Exception as e:
-                                print(f"Error processing frame {frame_num}, detection {track_id}: {str(e)}")
-                    
-                    # Cache the detection
-                    gender_detections[str(frame_num)].append({
-                        'id': track_id,
-                        'gender': gender,
-                        'confidence': confidence,
-                        'bbox': detection['bbox']
-                    })
-
-                detection['gender'] = {'gender': gender, 'confidence': confidence}
-                if track_id not in track_gender_votes:
-                    track_gender_votes[track_id] = {'male': 0, 'female': 0}
+                # Create new cluster
+                cluster_id = len(clusters)
+                similar_faces = dfs[0]['identity'].tolist()
                 
-                if gender in ['male', 'female']:
-                    track_gender_votes[track_id][gender] += confidence
-
-            pbar.update(1)
+                # Add similar faces to cluster
+                for face_path in similar_faces:
+                    face_name = os.path.basename(face_path)
+                    clusters[cluster_id].append(face_name)
+                    processed_files.add(face_name)
+                    
+            except Exception as e:
+                print(f"Error processing {face_file}: {str(e)}")
+                continue
         
-        pbar.close()
+        # Keep the two largest clusters
+        sorted_clusters = sorted(
+            clusters.items(), 
+            key=lambda x: len(x[1]), 
+            reverse=True
+        )[:2]
         
-        # Save gender detections cache
-        if not os.path.exists(self.gender_detections_file):
-            with open(self.gender_detections_file, 'w') as f:
-                json.dump(gender_detections, f, indent=2)
-
-        # Calculate persistence for each track
-        track_persistence = {
-            track_id: len(frames) 
-            for track_id, frames in track_frames.items()
-        }
-
-        # Determine primary gender for each track based on weighted votes
-        track_genders = {}  # {track_id: 'male'/'female'}
-        for track_id, votes in track_gender_votes.items():
-            male_votes = votes['male']
-            female_votes = votes['female']
+        # Copy files to person directories
+        for idx, (cluster_id, files) in enumerate(sorted_clusters):
+            person_dir = os.path.join(self.person_dirs, f"person_{idx+1}")
+            os.makedirs(person_dir, exist_ok=True)
             
-            # Assign gender based on plurality
-            if male_votes > female_votes:
-                track_genders[track_id] = 'male'
-            else:
-                track_genders[track_id] = 'female'
+            for file in files:
+                src = os.path.join(self.faces_dir, file)
+                dst = os.path.join(person_dir, file)
+                shutil.copy2(src, dst)
 
-        # Second pass: Frame-by-frame assignment ensuring one lead and one follow
+    def analyze_gender_and_assign_roles(self):
+        """Step 4: Analyze gender and assign lead/follow roles"""
+        print("Analyzing gender and assigning roles...")
+        
+        person_dirs = [d for d in os.listdir(self.person_dirs) 
+                      if d.startswith('person_')]
+        
+        gender_counts = {}
+        
+        for person_dir in person_dirs:
+            dir_path = os.path.join(self.person_dirs, person_dir)
+            files = os.listdir(dir_path)
+            
+            # Sample up to 10 images for gender analysis
+            sample_size = min(10, len(files))
+            sample_files = random.sample(files, sample_size)
+            
+            male_count = 0
+            female_count = 0
+            
+            for file in sample_files:
+                try:
+                    img_path = os.path.join(dir_path, file)
+                    result = DeepFace.analyze(
+                        img_path=img_path,
+                        actions=['gender'],
+                        enforce_detection=False
+                    )
+                    
+                    if isinstance(result, list):
+                        result = result[0]
+                        
+                    if result['gender'] == 'Man':
+                        male_count += 1
+                    else:
+                        female_count += 1
+                        
+                except Exception as e:
+                    print(f"Error analyzing {file}: {str(e)}")
+                    continue
+            
+            gender_counts[person_dir] = {
+                'male': male_count,
+                'female': female_count
+            }
+        
+        # Assign roles based on gender counts
+        sorted_dirs = sorted(
+            gender_counts.items(),
+            key=lambda x: x[1]['male'],
+            reverse=True
+        )
+        
+        if len(sorted_dirs) >= 2:
+            lead_dir = sorted_dirs[0][0]
+            follow_dir = sorted_dirs[1][0]
+            
+            # Copy files to role-specific directories
+            self._copy_files_to_role_dir(lead_dir, self.lead_faces_dir)
+            self._copy_files_to_role_dir(follow_dir, self.follow_faces_dir)
+            
+            # Create role assignments
+            self._create_role_assignments()
+
+    def _copy_files_to_role_dir(self, person_dir, role_dir):
+        """Helper to copy files from person directory to role directory"""
+        src_dir = os.path.join(self.person_dirs, person_dir)
+        for file in os.listdir(src_dir):
+            shutil.copy2(
+                os.path.join(src_dir, file),
+                os.path.join(role_dir, file)
+            )
+
+    def _create_role_assignments(self):
+        """Create lead and follow assignments based on face analysis"""
         lead_poses = {}
         follow_poses = {}
-
-        for frame_num in range(frame_count):
-            detections_in_frame = self.detections.get(frame_num, [])
+        
+        # Parse filenames to get frame numbers and track IDs
+        lead_assignments = self._parse_role_files(self.lead_faces_dir)
+        follow_assignments = self._parse_role_files(self.follow_faces_dir)
+        
+        # Create pose assignments
+        for frame_num in self.detections:
+            detections_in_frame = self.detections[frame_num]
             
-            # Get active tracks in this frame sorted by persistence
-            active_tracks = [
-                (d.get('id'), track_persistence[d.get('id')])
-                for d in detections_in_frame
-                if d.get('id') in track_persistence
-            ]
-            active_tracks.sort(key=lambda x: x[1], reverse=True)  # Sort by persistence
-            
-            lead_assigned = False
-            follow_assigned = False
-            
-            # First pass: Try to assign based on voted gender
-            for track_id, _ in active_tracks:
-                if track_genders[track_id] == 'male' and not lead_assigned:
-                    lead_pose = next(d for d in detections_in_frame if d.get('id') == track_id)
+            # Assign lead
+            if frame_num in lead_assignments:
+                lead_id = lead_assignments[frame_num]
+                lead_pose = next(
+                    (d for d in detections_in_frame if d['id'] == lead_id),
+                    None
+                )
+                if lead_pose:
                     lead_poses[str(frame_num)] = {
                         'id': lead_pose['id'],
                         'bbox': lead_pose['bbox'],
                         'confidence': lead_pose['confidence'],
                         'keypoints': lead_pose['keypoints']
                     }
-                    lead_assigned = True
-                elif track_genders[track_id] == 'female' and not follow_assigned:
-                    follow_pose = next(d for d in detections_in_frame if d.get('id') == track_id)
+            
+            # Assign follow
+            if frame_num in follow_assignments:
+                follow_id = follow_assignments[frame_num]
+                follow_pose = next(
+                    (d for d in detections_in_frame if d['id'] == follow_id),
+                    None
+                )
+                if follow_pose:
                     follow_poses[str(frame_num)] = {
                         'id': follow_pose['id'],
                         'bbox': follow_pose['bbox'],
                         'confidence': follow_pose['confidence'],
                         'keypoints': follow_pose['keypoints']
                     }
-                    follow_assigned = True
-                
-                if lead_assigned and follow_assigned:
-                    break
-            
-            # Second pass: Force assignment if needed
-            if not (lead_assigned and follow_assigned) and active_tracks:
-                for track_id, _ in active_tracks:
-                    if not lead_assigned:
-                        lead_pose = next(d for d in detections_in_frame if d.get('id') == track_id)
-                        lead_poses[str(frame_num)] = {
-                            'id': lead_pose['id'],
-                            'bbox': lead_pose['bbox'],
-                            'confidence': lead_pose['confidence'],
-                            'keypoints': lead_pose['keypoints']
-                        }
-                        lead_assigned = True
-                    elif not follow_assigned:
-                        follow_pose = next(d for d in detections_in_frame if d.get('id') == track_id)
-                        follow_poses[str(frame_num)] = {
-                            'id': follow_pose['id'],
-                            'bbox': follow_pose['bbox'],
-                            'confidence': follow_pose['confidence'],
-                            'keypoints': follow_pose['keypoints']
-                        }
-                        follow_assigned = True
-                    
-                    if lead_assigned and follow_assigned:
-                        break
-
-        # Save the results
+        
+        # Save assignments
         self.save_json(lead_poses, self.lead_file)
         self.save_json(follow_poses, self.follow_file)
 
-        print(f"Tracked lead and follow poses for {frame_count} frames.")
+    def _parse_role_files(self, role_dir):
+        """Parse role directory filenames to get frame/track assignments"""
+        assignments = {}
+        for filename in os.listdir(role_dir):
+            if filename.endswith('.jpg'):
+                frame_num, track_id = map(
+                    int,
+                    filename.split('.')[0].split('-')
+                )
+                assignments[frame_num] = track_id
+        return assignments
 
-    def create_debug_video(self):
-        """Creates a debug video showing gender detections with colored boxes"""
-        frame_count = len(os.listdir(self.figure_mask_dir))
+    def interpolate_missing_assignments(self):
+        """Step 6: Interpolate missing role assignments"""
+        print("Interpolating missing assignments...")
         
-        # Load gender detections
-        if not os.path.exists(self.gender_detections_file):
-            print("No gender detections file found. Run track_lead_and_follow first.")
-            return
-            
-        with open(self.gender_detections_file, 'r') as f:
-            gender_detections = json.load(f)
+        lead_poses = self.load_json(self.lead_file)
+        follow_poses = self.load_json(self.follow_file)
         
-        # Get first frame to determine video dimensions
-        first_frame = cv2.imread(os.path.join(self.figure_mask_dir, f"{0:06d}.png"))
-        if first_frame is None:
-            print("Could not read first frame")
-            return
-            
-        height, width = first_frame.shape[:2]
+        # Convert to frame numbers
+        lead_frames = set(map(int, lead_poses.keys()))
+        follow_frames = set(map(int, follow_poses.keys()))
         
-        # Initialize video writer with input video's framerate
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(self.debug_video_path, fourcc, self.fps, (width, height))
+        # Get all frame numbers
+        all_frames = sorted(set(self.detections.keys()))
         
-        pbar = tqdm.tqdm(total=frame_count, desc="Creating debug video")
+        # Interpolate lead poses
+        self._interpolate_role_poses(
+            lead_poses, lead_frames, all_frames, is_lead=True
+        )
         
-        for frame_num in range(frame_count):
-            frame_path = os.path.join(self.figure_mask_dir, f"{frame_num:06d}.png")
-            if not os.path.exists(frame_path):
-                continue
-                
-            frame = cv2.imread(frame_path)
-            if frame is None:
-                continue
-            
-            # Draw detections for this frame
-            frame_detections = gender_detections.get(str(frame_num), [])
-            for detection in frame_detections:
-                gender = detection['gender']
-                confidence = detection['confidence']
-                bbox = detection['bbox']
+        # Interpolate follow poses
+        self._interpolate_role_poses(
+            follow_poses, follow_frames, all_frames, is_lead=False
+        )
+        
+        # Save updated assignments
+        self.save_json(lead_poses, self.lead_file)
+        self.save_json(follow_poses, self.follow_file)
 
-                if confidence < 0.85: continue
+    def _interpolate_role_poses(self, role_poses, role_frames, all_frames, is_lead):
+        """Helper to interpolate missing poses for a role"""
+        for frame_num in all_frames:
+            if frame_num not in role_frames:
+                # Find nearest frames with assignments
+                prev_frame = max((f for f in role_frames if f < frame_num), default=None)
+                next_frame = min((f for f in role_frames if f > frame_num), default=None)
                 
-                if gender == 'male':
-                    color = (255, 0, 0)  # Blue for men
-                elif gender == 'female':
-                    color = (255, 0, 255)  # Magenta for women
-                else:
-                    # Draw gray box for unknown/low confidence detections
-                    color = (128, 128, 128)
-                
-                # Apply alpha based on confidence
-                alpha = max(0.3, min(1.0, confidence))
-                color = tuple(int(c * alpha) for c in color)
-                
-                # Draw bbox
-                x1, y1, x2, y2 = map(int, bbox)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                # Draw confidence score and track ID
-                text = f"ID:{detection['id']} {confidence:.2f}"
-                cv2.putText(frame, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.5, color, 2)
-            
-            out.write(frame)
-            pbar.update(1)
-        
-        pbar.close()
-        out.release()
-        print(f"Debug video saved to {self.debug_video_path}")
+                if prev_frame is not None:
+                    # Use track ID from previous frame
+                    prev_id = role_poses[str(prev_frame)]['id']
+                    detections_in_frame = self.detections.get(frame_num, [])
+                    matching_pose = next(
+                        (d for d in detections_in_frame if d['id'] == prev_id),
+                        None
+                    )
+                    
+                    if matching_pose:
+                        role_poses[str(frame_num)] = {
+                            'id': matching_pose['id'],
+                            'bbox': matching_pose['bbox'],
+                            'confidence': matching_pose['confidence'],
+                            'keypoints': matching_pose['keypoints']
+                        }
 
     #region UTILITY
 
