@@ -236,12 +236,15 @@ class DancerTracker:
             'male_confidence': 0,
             'female_confidence': 0,
             'race_votes': defaultdict(float),
-            'positions': [],  # (frame_num, x, y) tuples
-            'high_confidence_points': [],  # Will store anchor points
-            'stable_segments': []  # Will store periods of stable tracking
+            'positions': [],
+            'high_confidence_points': [],
+            'stable_segments': [],
+            'size_measurements': []  # Add size measurements
         })
+
+        simplified_race = 'dark'
         
-        # First pass: Collect all data and identify stable segments
+        # First pass: Collect all data
         for file_name, analysis in self.face_analysis.items():
             track_id = analysis['track_id']
             frame_num = analysis['frame_num']
@@ -251,8 +254,13 @@ class DancerTracker:
                  if d['id'] == track_id),
                 None
             )
-            
+
             if detection:
+                # Add size measurement
+                size = self._calculate_person_size(detection['keypoints'])
+                if size > 0:
+                    track_data[track_id]['size_measurements'].append(size)
+
                 bbox = detection['bbox']
                 center_x = (bbox[0] + bbox[2]) / 2
                 center_y = (bbox[1] + bbox[3]) / 2
@@ -296,6 +304,10 @@ class DancerTracker:
                             None
                         )
                         if detection:
+                            bbox = detection['bbox']
+                            center_x = (bbox[0] + bbox[2]) / 2
+                            center_y = (bbox[1] + bbox[3]) / 2
+
                             data['high_confidence_points'].append({
                                 'frame': frame_num,
                                 'position': (center_x, center_y),
@@ -304,7 +316,75 @@ class DancerTracker:
                                 'confidence': detection['confidence']
                             })
         
-        return self._analyze_track_stability(track_data)
+        # Modify track analysis to include size
+        track_analysis = {}
+        for track_id, data in track_data.items():
+            if not data['frames']:
+                continue
+            
+            # Calculate average size when enough measurements exist
+            size_measurements = data['size_measurements']
+            if len(size_measurements) > 5:  # Require minimum measurements
+                # Remove outliers (measurements outside 2 standard deviations)
+                mean_size = np.mean(size_measurements)
+                std_size = np.std(size_measurements)
+                filtered_sizes = [
+                    s for s in size_measurements 
+                    if abs(s - mean_size) <= 2 * std_size
+                ]
+                avg_size = np.mean(filtered_sizes) if filtered_sizes else mean_size
+            else:
+                avg_size = np.mean(size_measurements) if size_measurements else 0
+            
+            # Calculate demographic consensus
+            total_votes = data['male_votes'] + data['female_votes']
+            if total_votes > 0:
+                male_ratio = data['male_votes'] / total_votes
+                female_ratio = data['female_votes'] / total_votes
+                gender_consensus = max(male_ratio, female_ratio)
+            else:
+                gender_consensus = 0
+            
+            # Calculate race consensus
+            race_votes = data['race_votes']
+            total_race_votes = sum(race_votes.values())
+            race_consensus = max(race_votes.values()) / total_race_votes if total_race_votes > 0 else 0
+            
+            # Calculate tracking stability score
+            stability_score = sum(
+                segment['end_frame'] - segment['start_frame'] 
+                for segment in data['stable_segments']
+            ) / len(data['frames']) if data['frames'] else 0
+            
+            track_analysis[track_id] = {
+                'frames': sorted(data['frames']),
+                'stable_segments': data['stable_segments'],
+                'gender_consensus': gender_consensus,
+                'dominant_gender': 'Man' if data['male_votes'] > data['female_votes'] else 'Woman',
+                'race_consensus': race_consensus,
+                'dominant_race': max(data['race_votes'].items(), key=lambda x: x[1])[0] if data['race_votes'] else None,
+                'stability_score': stability_score,
+                'positions': sorted(data['positions'], key=lambda x: x[0]),
+                'average_size': avg_size  # Add size to analysis
+            }
+        
+        # Normalize size scores across all tracks
+        if track_analysis:
+            size_scores = [t['average_size'] for t in track_analysis.values() if t['average_size'] > 0]
+            if size_scores:
+                min_size = min(size_scores)
+                max_size = max(size_scores)
+                size_range = max_size - min_size
+                if size_range > 0:
+                    for track_id in track_analysis:
+                        if track_analysis[track_id]['average_size'] > 0:
+                            track_analysis[track_id]['size_score'] = (
+                                (track_analysis[track_id]['average_size'] - min_size) / size_range
+                            )
+                        else:
+                            track_analysis[track_id]['size_score'] = 0
+        
+        return track_analysis
 
     def _find_stable_segments(self, positions):
         """Identify segments of stable tracking based on motion consistency"""
@@ -347,7 +427,8 @@ class DancerTracker:
         
         return stable_segments
 
-    def _analyze_track_stability(self, track_data):
+    @staticmethod
+    def _analyze_track_stability(track_data):
         """Analyze tracks with emphasis on stability and proximity"""
         track_analysis = {}
         
@@ -384,7 +465,8 @@ class DancerTracker:
                 'race_consensus': race_consensus,
                 'dominant_race': max(data['race_votes'].items(), key=lambda x: x[1])[0] if data['race_votes'] else None,
                 'stability_score': stability_score,
-                'positions': sorted(data['positions'], key=lambda x: x[0])
+                'positions': sorted(data['positions'], key=lambda x: x[0]),
+                'average_size': data['average_size']  # Add size to analysis
             }
         
         return track_analysis
@@ -468,68 +550,26 @@ class DancerTracker:
         
         return lead_poses, follow_poses
 
-    def _enforce_role_coverage(self, frame_num, active_tracks, lead_poses, follow_poses,
+    @staticmethod
+    def _enforce_role_coverage(frame_num, active_tracks, lead_poses, follow_poses,
                                current_lead, current_follow):
         """Ensure that roles are assigned when poses are available"""
         frame_str = str(frame_num)
         
-        # If we have exactly one detection, assign it to maintain the most recent role
-        if len(active_tracks) == 1:
-            track_id, detection, analysis = active_tracks[0]
-            
-            # If this track was previously assigned a role, maintain it
-            if track_id == current_lead:
-                if frame_str not in lead_poses:
-                    lead_poses[frame_str] = {
-                        'id': detection['id'],
-                        'bbox': detection['bbox'],
-                        'confidence': detection['confidence'],
-                        'keypoints': detection['keypoints'],
-                        'single_detection': True
-                    }
-            elif track_id == current_follow:
-                if frame_str not in follow_poses:
-                    follow_poses[frame_str] = {
-                        'id': detection['id'],
-                        'bbox': detection['bbox'],
-                        'confidence': detection['confidence'],
-                        'keypoints': detection['keypoints'],
-                        'single_detection': True
-                    }
-            else:
-                # New track, assign based on gender if confident, otherwise prefer lead
-                if (analysis['gender_consensus'] > 0.8 and 
-                    analysis['dominant_gender'] == 'Woman'):
-                    follow_poses[frame_str] = {
-                        'id': detection['id'],
-                        'bbox': detection['bbox'],
-                        'confidence': detection['confidence'],
-                        'keypoints': detection['keypoints'],
-                        'single_detection': True
-                    }
-                else:
-                    lead_poses[frame_str] = {
-                        'id': detection['id'],
-                        'bbox': detection['bbox'],
-                        'confidence': detection['confidence'],
-                        'keypoints': detection['keypoints'],
-                        'single_detection': True
-                    }
-        
-        # If we have two or more detections, ensure both roles are assigned
-        elif len(active_tracks) >= 2:
+        if len(active_tracks) >= 2:
             if frame_str not in lead_poses or frame_str not in follow_poses:
-                # Score all tracks for both roles
                 scores = []
                 for track_id, detection, analysis in active_tracks:
                     lead_score = (
                         (analysis['stability_score'] * 2) +
                         (1.0 if analysis['dominant_gender'] == 'Man' else 0) +
+                        analysis.get('size_score', 0) +  # Add size score
                         (0.5 if track_id == current_lead else 0)
                     )
                     follow_score = (
                         (analysis['stability_score'] * 2) +
                         (1.0 if analysis['dominant_gender'] == 'Woman' else 0) +
+                        (1.0 - analysis.get('size_score', 0)) +  # Inverse size score for follow
                         (0.5 if track_id == current_follow else 0)
                     )
                     scores.append((track_id, detection, analysis, lead_score, follow_score))
@@ -602,7 +642,8 @@ class DancerTracker:
                             }
                             break
 
-    def _check_proximity(self, active_tracks):
+    @staticmethod
+    def _check_proximity(active_tracks):
         """Check if any two poses are in close proximity"""
         if len(active_tracks) < 2:
             return False
@@ -631,7 +672,8 @@ class DancerTracker:
         
         return False
 
-    def _assign_roles_stable(self, frame_num, active_tracks, lead_poses, follow_poses,
+    @staticmethod
+    def _assign_roles_stable(frame_num, active_tracks, lead_poses, follow_poses,
                             current_lead, current_follow):
         """Assign roles with high inertia when tracks are stable"""
         for track_id, detection, analysis in active_tracks:
@@ -653,10 +695,10 @@ class DancerTracker:
                     'stable': True
                 }
 
-    def _assign_roles_proximity(self, frame_num, active_tracks, lead_poses, follow_poses,
+    @staticmethod
+    def _assign_roles_proximity(frame_num, active_tracks, lead_poses, follow_poses,
                                 current_lead, current_follow):
         """Carefully assign roles when poses are in close proximity"""
-        # Score each track based on multiple factors
         scores = []
         for track_id, detection, analysis in active_tracks:
             score = 0
@@ -667,6 +709,9 @@ class DancerTracker:
             # Add demographic consensus score
             if analysis['dominant_gender'] == 'Man':
                 score += analysis['gender_consensus']
+            
+            # Add size score with same weight as gender
+            score += analysis.get('size_score', 0)
             
             # Add continuity bonus
             if track_id == current_lead:
@@ -729,6 +774,58 @@ class DancerTracker:
             return {key: self.numpy_to_python(value) for key, value in obj.items()}
         else:
             return obj
+
+    @staticmethod
+    def _calculate_person_size(keypoints):
+        """Calculate person size based on limb lengths and torso measurements"""
+        # Skip points with low confidence or (0,0) coordinates
+        valid_points = [
+            (x, y) for x, y, conf in keypoints 
+            if conf > 0.3 and (x != 0 or y != 0)
+        ]
+        
+        if len(valid_points) < 5:  # Need minimum points for size calculation
+            return 0
+        
+        total_length = 0
+        point_count = 0
+        
+        # Keypoint indices for different body parts
+        connections = [
+            # Arms
+            (5, 7),  # Left upper arm
+            (7, 9),  # Left lower arm
+            (6, 8),  # Right upper arm
+            (8, 10), # Right lower arm
+            # Legs
+            (11, 13), # Left upper leg
+            (13, 15), # Left lower leg
+            (12, 14), # Right upper leg
+            (14, 16), # Right lower leg
+            # Torso measurements
+            (5, 11),  # Left torso
+            (6, 12),  # Right torso
+            (5, 6),   # Shoulders
+            (11, 12), # Hips
+        ]
+        
+        # Calculate lengths between connected points
+        for start_idx, end_idx in connections:
+            if (start_idx < len(keypoints) and end_idx < len(keypoints) and
+                keypoints[start_idx][2] > 0.3 and keypoints[end_idx][2] > 0.3 and
+                not (keypoints[start_idx][0] == 0 and keypoints[start_idx][1] == 0) and
+                not (keypoints[end_idx][0] == 0 and keypoints[end_idx][1] == 0)):
+                
+                start_point = keypoints[start_idx][:2]
+                end_point = keypoints[end_idx][:2]
+                
+                length = ((end_point[0] - start_point[0])**2 + 
+                         (end_point[1] - start_point[1])**2)**0.5
+                
+                total_length += length
+                point_count += 1
+        
+        return total_length / point_count if point_count > 0 else 0
 
     #endregion
 
