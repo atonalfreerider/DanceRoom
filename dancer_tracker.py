@@ -39,6 +39,13 @@ class DancerTracker:
         self.frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         cap.release()
 
+        # Add new path for analysis cache
+        self.analysis_cache_file = os.path.join(output_dir, 'face_analysis.json')
+        
+        # Remove folder creation for lead/follow dirs since we won't use them
+        for dir_path in [self.faces_dir]:
+            os.makedirs(dir_path, exist_ok=True)
+
     def process_video(self):
         # Check if faces directory already has crops
         existing_faces = os.listdir(self.faces_dir)
@@ -47,7 +54,7 @@ class DancerTracker:
         else:
             print(f"Found {len(existing_faces)} existing face crops, skipping extraction...")
         
-        self.analyze_and_sort_by_gender()
+        self.analyze_faces()
         self.create_role_assignments()
         self.interpolate_missing_assignments()
         print("Lead and follow tracked using DeepFace approach")
@@ -132,108 +139,122 @@ class DancerTracker:
         
         return [int(x_min), int(y_min), int(x_max), int(y_max)]
 
-    def analyze_and_sort_by_gender(self):
-        """Analyze each face for gender and sort into lead/follow folders"""
-        print("Analyzing faces for gender...")
-        
-        # Clear existing role directories
-        for dir_path in [self.lead_faces_dir, self.follow_faces_dir]:
-            if os.path.exists(dir_path):
-                shutil.rmtree(dir_path)
-            os.makedirs(dir_path)
-        
+    def analyze_faces(self):
+        """Analyze each face for gender and race, cache results"""
+        # Check for existing analysis cache
+        if os.path.exists(self.analysis_cache_file):
+            print("Loading cached face analysis results...")
+            with open(self.analysis_cache_file, 'r') as f:
+                self.face_analysis = json.load(f)
+            
+            # Print statistics from cache
+            male_count = sum(1 for data in self.face_analysis.values() 
+                            if data['dominant_gender'] == 'Man')
+            female_count = sum(1 for data in self.face_analysis.values() 
+                              if data['dominant_gender'] == 'Woman')
+            print(f"Loaded {male_count} male and {female_count} female cached analyses")
+            return
+
+        print("Analyzing faces for gender and race...")
         face_files = os.listdir(self.faces_dir)
         
         if not face_files:
             raise Exception("No face crops found!")
+        
+        self.face_analysis = {}
         
         for face_file in tqdm.tqdm(face_files):
             try:
                 img_path = os.path.join(self.faces_dir, face_file)
                 result = DeepFace.analyze(
                     img_path=img_path,
-                    actions=['gender'],
+                    actions=['gender', 'race'],
                     enforce_detection=False
                 )
                 
                 if isinstance(result, list):
                     result = result[0]
                 
-                # Copy to appropriate folder based on gender
-                if result['dominant_gender'] == 'Man':
-                    dst = os.path.join(self.lead_faces_dir, face_file)
-                else:  # 'Woman'
-                    dst = os.path.join(self.follow_faces_dir, face_file)
-                    
-                shutil.copy2(img_path, dst)
+                # Parse frame number and track id from filename
+                frame_num, track_id = map(
+                    int,
+                    face_file.split('.')[0].split('-')
+                )
                 
+                # Store analysis results
+                self.face_analysis[face_file] = {
+                    'frame_num': frame_num,
+                    'track_id': track_id,
+                    'dominant_gender': result['dominant_gender'],
+                    'gender_confidence': result['gender'][result['dominant_gender']],
+                    'dominant_race': result['dominant_race'],
+                    'race_confidence': result['race'][result['dominant_race']]
+                }
+                    
             except Exception as e:
                 print(f"Error analyzing {face_file}: {str(e)}")
                 continue
         
+        # Save analysis cache
+        with open(self.analysis_cache_file, 'w') as f:
+            json.dump(self.face_analysis, f, indent=2)
+        
         # Print statistics
-        lead_count = len(os.listdir(self.lead_faces_dir))
-        follow_count = len(os.listdir(self.follow_faces_dir))
-        print(f"Sorted {lead_count} male (lead) and {follow_count} female (follow) faces")
+        male_count = sum(1 for data in self.face_analysis.values() 
+                        if data['dominant_gender'] == 'Man')
+        female_count = sum(1 for data in self.face_analysis.values() 
+                          if data['dominant_gender'] == 'Woman')
+        print(f"Analyzed {male_count} male and {female_count} female faces")
+        
+        # Print race statistics
+        race_counts = defaultdict(int)
+        for data in self.face_analysis.values():
+            race_counts[data['dominant_race']] += 1
+        print("\nRace distribution:")
+        for race, count in race_counts.items():
+            print(f"{race}: {count}")
 
     def create_role_assignments(self):
         """Create lead and follow assignments based on gender analysis"""
         lead_poses = {}
         follow_poses = {}
         
-        # Parse filenames to get frame numbers and track IDs
-        lead_assignments = self._parse_role_files(self.lead_faces_dir)
-        follow_assignments = self._parse_role_files(self.follow_faces_dir)
+        # Group analyses by frame number
+        frame_analyses = defaultdict(list)
+        for file_name, analysis in self.face_analysis.items():
+            frame_analyses[analysis['frame_num']].append(analysis)
         
         # Create pose assignments
         for frame_num in self.detections:
             detections_in_frame = self.detections[frame_num]
+            analyses_in_frame = frame_analyses.get(frame_num, [])
             
-            # Assign lead
-            if frame_num in lead_assignments:
-                lead_id = lead_assignments[frame_num]
-                lead_pose = next(
-                    (d for d in detections_in_frame if d['id'] == lead_id),
+            for analysis in analyses_in_frame:
+                track_id = analysis['track_id']
+                pose = next(
+                    (d for d in detections_in_frame if d['id'] == track_id),
                     None
                 )
-                if lead_pose:
-                    lead_poses[str(frame_num)] = {
-                        'id': lead_pose['id'],
-                        'bbox': lead_pose['bbox'],
-                        'confidence': lead_pose['confidence'],
-                        'keypoints': lead_pose['keypoints']
+                
+                if pose:
+                    pose_data = {
+                        'id': pose['id'],
+                        'bbox': pose['bbox'],
+                        'confidence': pose['confidence'],
+                        'keypoints': pose['keypoints'],
+                        'gender_confidence': analysis['gender_confidence'],
+                        'race': analysis['dominant_race'],
+                        'race_confidence': analysis['race_confidence']
                     }
-            
-            # Assign follow
-            if frame_num in follow_assignments:
-                follow_id = follow_assignments[frame_num]
-                follow_pose = next(
-                    (d for d in detections_in_frame if d['id'] == follow_id),
-                    None
-                )
-                if follow_pose:
-                    follow_poses[str(frame_num)] = {
-                        'id': follow_pose['id'],
-                        'bbox': follow_pose['bbox'],
-                        'confidence': follow_pose['confidence'],
-                        'keypoints': follow_pose['keypoints']
-                    }
+                    
+                    if analysis['dominant_gender'] == 'Man':
+                        lead_poses[str(frame_num)] = pose_data
+                    else:
+                        follow_poses[str(frame_num)] = pose_data
         
         # Save assignments
         self.save_json(lead_poses, self.lead_file)
         self.save_json(follow_poses, self.follow_file)
-
-    def _parse_role_files(self, role_dir):
-        """Parse role directory filenames to get frame/track assignments"""
-        assignments = {}
-        for filename in os.listdir(role_dir):
-            if filename.endswith('.jpg'):
-                frame_num, track_id = map(
-                    int,
-                    filename.split('.')[0].split('-')
-                )
-                assignments[frame_num] = track_id
-        return assignments
 
     def interpolate_missing_assignments(self):
         """Step 6: Interpolate missing role assignments"""
@@ -273,7 +294,7 @@ class DancerTracker:
                 
                 if prev_frame is not None:
                     # Use track ID from previous frame
-                    prev_id = role_poses[str(prev_frame)]['id']
+                    prev_id = role_poses[prev_frame]['id']
                     detections_in_frame = self.detections.get(frame_num, [])
                     matching_pose = next(
                         (d for d in detections_in_frame if d['id'] == prev_id),
