@@ -228,7 +228,7 @@ class DancerTracker:
         self.save_json(follow_poses, self.follow_file)
 
     def analyze_tracks_demographics(self):
-        """Analyze demographic consistency for each track with confidence anchors"""
+        """Analyze demographic consistency with emphasis on track stability"""
         track_data = defaultdict(lambda: {
             'frames': [],
             'male_votes': 0,
@@ -237,10 +237,11 @@ class DancerTracker:
             'female_confidence': 0,
             'race_votes': defaultdict(float),
             'positions': [],  # (frame_num, x, y) tuples
-            'high_confidence_points': []  # Will store anchor points
+            'high_confidence_points': [],  # Will store anchor points
+            'stable_segments': []  # Will store periods of stable tracking
         })
         
-        # First pass: Collect all data and identify high confidence points
+        # First pass: Collect all data and identify stable segments
         for file_name, analysis in self.face_analysis.items():
             track_id = analysis['track_id']
             frame_num = analysis['frame_num']
@@ -260,7 +261,7 @@ class DancerTracker:
                 track_data[track_id]['positions'].append((frame_num, center_x, center_y))
                 track_data[track_id]['frames'].append(frame_num)
                 
-                # Add gender vote
+                # Add demographic votes with reduced weight
                 if analysis['dominant_gender'] == 'Man':
                     track_data[track_id]['male_votes'] += 1
                     track_data[track_id]['male_confidence'] += analysis['gender_confidence']
@@ -268,248 +269,438 @@ class DancerTracker:
                     track_data[track_id]['female_votes'] += 1
                     track_data[track_id]['female_confidence'] += analysis['gender_confidence']
                 
-                # Add race vote
                 race = analysis['dominant_race']
                 confidence = analysis['race_confidence']
                 simplified_race = 'dark' if race in ['indian', 'black'] else 'light'
                 track_data[track_id]['race_votes'][simplified_race] += confidence
-                
-                # Check if this is a high confidence point
-                gender_conf = analysis['gender_confidence']
-                race_conf = analysis['race_confidence']
-                pose_conf = detection['confidence']
-                
-                # Define criteria for high confidence points
-                if (gender_conf > 0.9 and race_conf > 0.8 and pose_conf > 0.8):
-                    track_data[track_id]['high_confidence_points'].append({
-                        'frame': frame_num,
-                        'position': (center_x, center_y),
-                        'gender': analysis['dominant_gender'],
-                        'race': simplified_race,
-                        'confidence': (gender_conf + race_conf + pose_conf) / 3
-                    })
         
-        # Second pass: Analyze tracks and create bridges
+        # Identify stable tracking segments
+        for track_id, data in track_data.items():
+            positions = sorted(data['positions'], key=lambda x: x[0])
+            stable_segments = self._find_stable_segments(positions)
+            data['stable_segments'] = stable_segments
+            
+            # Only consider high confidence points within stable segments
+            for segment in stable_segments:
+                segment_frames = range(segment['start_frame'], segment['end_frame'] + 1)
+                for frame_num in segment_frames:
+                    analysis = next(
+                        (a for a in self.face_analysis.values()
+                         if a['frame_num'] == frame_num and a['track_id'] == track_id),
+                        None
+                    )
+                    if analysis and analysis['gender_confidence'] > 0.9:
+                        detection = next(
+                            (d for d in self.detections.get(frame_num, [])
+                             if d['id'] == track_id),
+                            None
+                        )
+                        if detection:
+                            data['high_confidence_points'].append({
+                                'frame': frame_num,
+                                'position': (center_x, center_y),
+                                'gender': analysis['dominant_gender'],
+                                'race': simplified_race,
+                                'confidence': detection['confidence']
+                            })
+        
+        return self._analyze_track_stability(track_data)
+
+    def _find_stable_segments(self, positions):
+        """Identify segments of stable tracking based on motion consistency"""
+        stable_segments = []
+        current_segment = None
+        max_speed = self.frame_width * 0.1  # 10% of frame width per frame
+        
+        for i in range(len(positions) - 1):
+            curr_frame, curr_x, curr_y = positions[i]
+            next_frame, next_x, next_y = positions[i + 1]
+            
+            # Calculate motion
+            frame_diff = next_frame - curr_frame
+            if frame_diff == 0:
+                continue
+                
+            distance = ((next_x - curr_x)**2 + (next_y - curr_y)**2)**0.5
+            speed = distance / frame_diff
+            
+            # Check if motion is stable
+            if speed <= max_speed and frame_diff <= 3:  # Allow small gaps
+                if current_segment is None:
+                    current_segment = {
+                        'start_frame': curr_frame,
+                        'end_frame': next_frame,
+                        'positions': [positions[i]]
+                    }
+                else:
+                    current_segment['end_frame'] = next_frame
+                    current_segment['positions'].append(positions[i])
+            else:
+                if current_segment is not None:
+                    if len(current_segment['positions']) > 5:  # Minimum segment length
+                        stable_segments.append(current_segment)
+                    current_segment = None
+        
+        # Add final segment if it exists
+        if current_segment is not None and len(current_segment['positions']) > 5:
+            stable_segments.append(current_segment)
+        
+        return stable_segments
+
+    def _analyze_track_stability(self, track_data):
+        """Analyze tracks with emphasis on stability and proximity"""
         track_analysis = {}
+        
+        # First pass: Calculate basic stability metrics
         for track_id, data in track_data.items():
             if not data['frames']:
                 continue
-                
-            # Sort frames and high confidence points
-            data['frames'].sort()
-            data['high_confidence_points'].sort(key=lambda x: x['frame'])
             
-            # Calculate basic demographics
-            male_score = data['male_confidence'] / max(1, data['male_votes'])
-            female_score = data['female_confidence'] / max(1, data['female_votes'])
+            # Calculate demographic consensus
+            total_votes = data['male_votes'] + data['female_votes']
+            if total_votes > 0:
+                male_ratio = data['male_votes'] / total_votes
+                female_ratio = data['female_votes'] / total_votes
+                gender_consensus = max(male_ratio, female_ratio)
+            else:
+                gender_consensus = 0
             
-            race_scores = data['race_votes']
-            dominant_race = max(race_scores.items(), key=lambda x: x[1])[0] if race_scores else None
+            # Calculate race consensus
+            race_votes = data['race_votes']
+            total_race_votes = sum(race_votes.values())
+            race_consensus = max(race_votes.values()) / total_race_votes if total_race_votes > 0 else 0
             
-            # Analyze track segments
-            segments = self._analyze_track_segments(data)
+            # Calculate tracking stability score
+            stability_score = sum(
+                segment['end_frame'] - segment['start_frame'] 
+                for segment in data['stable_segments']
+            ) / len(data['frames']) if data['frames'] else 0
             
             track_analysis[track_id] = {
-                'frames': data['frames'],
-                'gender_score': {'male': male_score, 'female': female_score},
-                'dominant_race': dominant_race,
-                'race_confidence': max(race_scores.values()) if race_scores else 0,
-                'segments': segments,
-                'high_confidence_points': data['high_confidence_points']
+                'frames': sorted(data['frames']),
+                'stable_segments': data['stable_segments'],
+                'gender_consensus': gender_consensus,
+                'dominant_gender': 'Man' if data['male_votes'] > data['female_votes'] else 'Woman',
+                'race_consensus': race_consensus,
+                'dominant_race': max(data['race_votes'].items(), key=lambda x: x[1])[0] if data['race_votes'] else None,
+                'stability_score': stability_score,
+                'positions': sorted(data['positions'], key=lambda x: x[0])
             }
         
         return track_analysis
 
-    def _analyze_track_segments(self, track_data):
-        """Analyze track segments between high confidence points"""
-        segments = []
-        positions = sorted(track_data['positions'], key=lambda x: x[0])
-        high_conf_points = track_data['high_confidence_points']
-        
-        if not high_conf_points:
-            return []
-        
-        # Create segments between high confidence points
-        for i in range(len(high_conf_points) - 1):
-            start_point = high_conf_points[i]
-            end_point = high_conf_points[i + 1]
-            
-            # Get positions between these points
-            segment_positions = [
-                pos for pos in positions 
-                if start_point['frame'] <= pos[0] <= end_point['frame']
-            ]
-            
-            # Check segment validity
-            is_valid = self._validate_segment(
-                segment_positions,
-                start_point,
-                end_point
-            )
-            
-            segments.append({
-                'start_frame': start_point['frame'],
-                'end_frame': end_point['frame'],
-                'is_valid': is_valid,
-                'confidence': (start_point['confidence'] + end_point['confidence']) / 2
-            })
-        
-        return segments
-
-    def _validate_segment(self, positions, start_point, end_point):
-        """Validate a track segment between two high confidence points"""
-        if len(positions) < 2:
-            return False
-        
-        # Check temporal consistency
-        frame_gaps = [
-            positions[i+1][0] - positions[i][0] 
-            for i in range(len(positions)-1)
-        ]
-        if max(frame_gaps) > 5:  # Allow gaps of up to 5 frames
-            return False
-        
-        # Check spatial consistency
-        max_allowed_speed = self.frame_width * 0.1  # 10% of frame width per frame
-        for i in range(len(positions)-1):
-            dx = positions[i+1][1] - positions[i][1]
-            dy = positions[i+1][2] - positions[i][2]
-            distance = (dx*dx + dy*dy)**0.5
-            frames = positions[i+1][0] - positions[i][0]
-            if frames > 0 and distance/frames > max_allowed_speed:
-                return False
-        
-        return True
-
     def assign_roles_over_time(self, track_analysis):
-        """Assign lead and follow roles using track segments and confidence points"""
+        """Assign roles with emphasis on track stability and ensuring role coverage"""
         lead_poses = {}
         follow_poses = {}
         
-        # Group high confidence points by frame
-        confidence_points = defaultdict(list)
-        for track_id, analysis in track_analysis.items():
-            for point in analysis['high_confidence_points']:
-                confidence_points[point['frame']].append({
-                    'track_id': track_id,
-                    'point': point
-                })
+        # Sort tracks by stability score
+        sorted_tracks = sorted(
+            track_analysis.items(),
+            key=lambda x: x[1]['stability_score'],
+            reverse=True
+        )
         
-        # First pass: Assign roles at high confidence points
-        assigned_tracks = {'lead': set(), 'follow': set()}
+        # Initialize role assignments
+        current_lead = None
+        current_follow = None
         
-        for frame_num in sorted(confidence_points.keys()):
-            points = confidence_points[frame_num]
-            if len(points) >= 2:
-                # Score points for lead/follow roles
-                lead_candidates = []
-                follow_candidates = []
-                
-                for point_data in points:
-                    track_id = point_data['track_id']
-                    point = point_data['point']
-                    analysis = track_analysis[track_id]
-                    
-                    male_score = analysis['gender_score']['male']
-                    female_score = analysis['gender_score']['female']
-                    
-                    lead_score = male_score * point['confidence']
-                    follow_score = female_score * point['confidence']
-                    
-                    lead_candidates.append((lead_score, track_id, point))
-                    follow_candidates.append((follow_score, track_id, point))
-                
-                # Assign roles at high confidence points
-                self._assign_roles_at_point(
-                    frame_num, 
-                    lead_candidates, 
-                    follow_candidates, 
-                    lead_poses, 
-                    follow_poses,
-                    assigned_tracks
-                )
-        
-        # Second pass: Fill gaps between high confidence points
+        # Process frames in order
         all_frames = sorted(set(self.detections.keys()))
         
-        for track_id, analysis in track_analysis.items():
-            for segment in analysis['segments']:
-                if segment['is_valid']:
-                    start_frame = segment['start_frame']
-                    end_frame = segment['end_frame']
-                    
-                    # Fill gaps if this track is assigned a role
-                    if track_id in assigned_tracks['lead']:
-                        self._fill_track_gap(
-                            track_id, start_frame, end_frame, lead_poses
-                        )
-                    elif track_id in assigned_tracks['follow']:
-                        self._fill_track_gap(
-                            track_id, start_frame, end_frame, follow_poses
-                        )
+        for frame_num in all_frames:
+            detections_in_frame = self.detections.get(frame_num, [])
+            
+            # Get active tracks in this frame
+            active_tracks = []
+            for track_id, analysis in track_analysis.items():
+                if frame_num in analysis['frames']:
+                    detection = next(
+                        (d for d in detections_in_frame if d['id'] == track_id),
+                        None
+                    )
+                    if detection:
+                        active_tracks.append((track_id, detection, analysis))
+            
+            if not active_tracks:
+                continue
+                
+            # Check for close proximity situations
+            proximity_warning = self._check_proximity(active_tracks)
+            
+            # Update role assignments
+            if proximity_warning:
+                # Use more careful assignment when poses are close
+                self._assign_roles_proximity(
+                    frame_num,
+                    active_tracks,
+                    lead_poses,
+                    follow_poses,
+                    current_lead,
+                    current_follow
+                )
+            else:
+                # Use stable tracking when poses are far apart
+                self._assign_roles_stable(
+                    frame_num,
+                    active_tracks,
+                    lead_poses,
+                    follow_poses,
+                    current_lead,
+                    current_follow
+                )
+            
+            # Ensure roles are assigned if we have detections
+            self._enforce_role_coverage(
+                frame_num,
+                active_tracks,
+                lead_poses,
+                follow_poses,
+                current_lead,
+                current_follow
+            )
+            
+            # Update current assignments
+            if str(frame_num) in lead_poses:
+                current_lead = lead_poses[str(frame_num)]['id']
+            if str(frame_num) in follow_poses:
+                current_follow = follow_poses[str(frame_num)]['id']
         
         return lead_poses, follow_poses
 
-    def _assign_roles_at_point(self, frame_num, lead_candidates, follow_candidates, 
-                              lead_poses, follow_poses, assigned_tracks):
-        """Assign roles at a high confidence point"""
-        lead_candidates.sort(reverse=True)
-        follow_candidates.sort(reverse=True)
+    def _enforce_role_coverage(self, frame_num, active_tracks, lead_poses, follow_poses,
+                               current_lead, current_follow):
+        """Ensure that roles are assigned when poses are available"""
+        frame_str = str(frame_num)
         
-        # Try to assign lead
-        for lead_score, lead_id, point in lead_candidates:
-            detection = next(
-                (d for d in self.detections.get(frame_num, []) 
-                 if d['id'] == lead_id),
-                None
-            )
-            if detection:
+        # If we have exactly one detection, assign it to maintain the most recent role
+        if len(active_tracks) == 1:
+            track_id, detection, analysis = active_tracks[0]
+            
+            # If this track was previously assigned a role, maintain it
+            if track_id == current_lead:
+                if frame_str not in lead_poses:
+                    lead_poses[frame_str] = {
+                        'id': detection['id'],
+                        'bbox': detection['bbox'],
+                        'confidence': detection['confidence'],
+                        'keypoints': detection['keypoints'],
+                        'single_detection': True
+                    }
+            elif track_id == current_follow:
+                if frame_str not in follow_poses:
+                    follow_poses[frame_str] = {
+                        'id': detection['id'],
+                        'bbox': detection['bbox'],
+                        'confidence': detection['confidence'],
+                        'keypoints': detection['keypoints'],
+                        'single_detection': True
+                    }
+            else:
+                # New track, assign based on gender if confident, otherwise prefer lead
+                if (analysis['gender_consensus'] > 0.8 and 
+                    analysis['dominant_gender'] == 'Woman'):
+                    follow_poses[frame_str] = {
+                        'id': detection['id'],
+                        'bbox': detection['bbox'],
+                        'confidence': detection['confidence'],
+                        'keypoints': detection['keypoints'],
+                        'single_detection': True
+                    }
+                else:
+                    lead_poses[frame_str] = {
+                        'id': detection['id'],
+                        'bbox': detection['bbox'],
+                        'confidence': detection['confidence'],
+                        'keypoints': detection['keypoints'],
+                        'single_detection': True
+                    }
+        
+        # If we have two or more detections, ensure both roles are assigned
+        elif len(active_tracks) >= 2:
+            if frame_str not in lead_poses or frame_str not in follow_poses:
+                # Score all tracks for both roles
+                scores = []
+                for track_id, detection, analysis in active_tracks:
+                    lead_score = (
+                        (analysis['stability_score'] * 2) +
+                        (1.0 if analysis['dominant_gender'] == 'Man' else 0) +
+                        (0.5 if track_id == current_lead else 0)
+                    )
+                    follow_score = (
+                        (analysis['stability_score'] * 2) +
+                        (1.0 if analysis['dominant_gender'] == 'Woman' else 0) +
+                        (0.5 if track_id == current_follow else 0)
+                    )
+                    scores.append((track_id, detection, analysis, lead_score, follow_score))
+                
+                # Sort by total score
+                scores.sort(key=lambda x: x[3] + x[4], reverse=True)
+                
+                # Assign the two highest scoring tracks to roles
+                if frame_str not in lead_poses and frame_str not in follow_poses:
+                    # Assign best two tracks based on their relative scores
+                    track1_id, det1, _, lead1_score, follow1_score = scores[0]
+                    track2_id, det2, _, lead2_score, follow2_score = scores[1]
+                    
+                    if lead1_score > follow1_score:
+                        # First track is lead
+                        lead_poses[frame_str] = {
+                            'id': det1['id'],
+                            'bbox': det1['bbox'],
+                            'confidence': det1['confidence'],
+                            'keypoints': det1['keypoints'],
+                            'enforced': True
+                        }
+                        follow_poses[frame_str] = {
+                            'id': det2['id'],
+                            'bbox': det2['bbox'],
+                            'confidence': det2['confidence'],
+                            'keypoints': det2['keypoints'],
+                            'enforced': True
+                        }
+                    else:
+                        # First track is follow
+                        follow_poses[frame_str] = {
+                            'id': det1['id'],
+                            'bbox': det1['bbox'],
+                            'confidence': det1['confidence'],
+                            'keypoints': det1['keypoints'],
+                            'enforced': True
+                        }
+                        lead_poses[frame_str] = {
+                            'id': det2['id'],
+                            'bbox': det2['bbox'],
+                            'confidence': det2['confidence'],
+                            'keypoints': det2['keypoints'],
+                            'enforced': True
+                        }
+                elif frame_str not in lead_poses:
+                    # Find best unassigned track for lead
+                    follow_id = follow_poses[frame_str]['id']
+                    for track_id, detection, _, lead_score, _ in scores:
+                        if track_id != follow_id:
+                            lead_poses[frame_str] = {
+                                'id': detection['id'],
+                                'bbox': detection['bbox'],
+                                'confidence': detection['confidence'],
+                                'keypoints': detection['keypoints'],
+                                'enforced': True
+                            }
+                            break
+                elif frame_str not in follow_poses:
+                    # Find best unassigned track for follow
+                    lead_id = lead_poses[frame_str]['id']
+                    for track_id, detection, _, _, follow_score in scores:
+                        if track_id != lead_id:
+                            follow_poses[frame_str] = {
+                                'id': detection['id'],
+                                'bbox': detection['bbox'],
+                                'confidence': detection['confidence'],
+                                'keypoints': detection['keypoints'],
+                                'enforced': True
+                            }
+                            break
+
+    def _check_proximity(self, active_tracks):
+        """Check if any two poses are in close proximity"""
+        if len(active_tracks) < 2:
+            return False
+            
+        for i in range(len(active_tracks)):
+            for j in range(i + 1, len(active_tracks)):
+                _, det1, _ = active_tracks[i]
+                _, det2, _ = active_tracks[j]
+                
+                # Calculate center points
+                center1 = ((det1['bbox'][0] + det1['bbox'][2])/2,
+                          (det1['bbox'][1] + det1['bbox'][3])/2)
+                center2 = ((det2['bbox'][0] + det2['bbox'][2])/2,
+                          (det2['bbox'][1] + det2['bbox'][3])/2)
+                
+                # Calculate distance
+                distance = ((center1[0] - center2[0])**2 +
+                           (center1[1] - center2[1])**2)**0.5
+                
+                # Check if distance is less than average person width
+                avg_width = (det1['bbox'][2] - det1['bbox'][0] +
+                            det2['bbox'][2] - det2['bbox'][0]) / 2
+                
+                if distance < avg_width * 1.5:  # Proximity threshold
+                    return True
+        
+        return False
+
+    def _assign_roles_stable(self, frame_num, active_tracks, lead_poses, follow_poses,
+                            current_lead, current_follow):
+        """Assign roles with high inertia when tracks are stable"""
+        for track_id, detection, analysis in active_tracks:
+            # Maintain current assignments if track is stable
+            if track_id == current_lead:
                 lead_poses[str(frame_num)] = {
                     'id': detection['id'],
                     'bbox': detection['bbox'],
                     'confidence': detection['confidence'],
                     'keypoints': detection['keypoints'],
-                    'score': float(lead_score)
+                    'stable': True
                 }
-                assigned_tracks['lead'].add(lead_id)
-                break
-        
-        # Try to assign follow
-        for follow_score, follow_id, point in follow_candidates:
-            if follow_id != lead_id:  # Ensure different from lead
-                detection = next(
-                    (d for d in self.detections.get(frame_num, []) 
-                     if d['id'] == follow_id),
-                    None
-                )
-                if detection:
-                    follow_poses[str(frame_num)] = {
-                        'id': detection['id'],
-                        'bbox': detection['bbox'],
-                        'confidence': detection['confidence'],
-                        'keypoints': detection['keypoints'],
-                        'score': float(follow_score)
-                    }
-                    assigned_tracks['follow'].add(follow_id)
-                    break
+            elif track_id == current_follow:
+                follow_poses[str(frame_num)] = {
+                    'id': detection['id'],
+                    'bbox': detection['bbox'],
+                    'confidence': detection['confidence'],
+                    'keypoints': detection['keypoints'],
+                    'stable': True
+                }
 
-    def _fill_track_gap(self, track_id, start_frame, end_frame, poses_dict):
-        """Fill gaps in tracking between start and end frames"""
-        for frame_num in range(start_frame, end_frame + 1):
-            if str(frame_num) not in poses_dict:
-                detection = next(
-                    (d for d in self.detections.get(frame_num, []) 
-                     if d['id'] == track_id),
-                    None
-                )
-                if detection:
-                    poses_dict[str(frame_num)] = {
-                        'id': detection['id'],
-                        'bbox': detection['bbox'],
-                        'confidence': detection['confidence'],
-                        'keypoints': detection['keypoints'],
-                        'interpolated': True
-                    }
+    def _assign_roles_proximity(self, frame_num, active_tracks, lead_poses, follow_poses,
+                                current_lead, current_follow):
+        """Carefully assign roles when poses are in close proximity"""
+        # Score each track based on multiple factors
+        scores = []
+        for track_id, detection, analysis in active_tracks:
+            score = 0
+            
+            # Add stability score
+            score += analysis['stability_score'] * 2
+            
+            # Add demographic consensus score
+            if analysis['dominant_gender'] == 'Man':
+                score += analysis['gender_consensus']
+            
+            # Add continuity bonus
+            if track_id == current_lead:
+                score += 0.5
+            elif track_id == current_follow:
+                score -= 0.5
+            
+            scores.append((score, track_id, detection, analysis))
+        
+        # Sort by score
+        scores.sort(reverse=True)
+        
+        # Assign roles
+        if len(scores) >= 2:
+            lead_score, lead_id, lead_detection, _ = scores[0]
+            follow_score, follow_id, follow_detection, _ = scores[1]
+            
+            lead_poses[str(frame_num)] = {
+                'id': lead_detection['id'],
+                'bbox': lead_detection['bbox'],
+                'confidence': lead_detection['confidence'],
+                'keypoints': lead_detection['keypoints'],
+                'score': float(lead_score),
+                'proximity': True
+            }
+            
+            follow_poses[str(frame_num)] = {
+                'id': follow_detection['id'],
+                'bbox': follow_detection['bbox'],
+                'confidence': follow_detection['confidence'],
+                'keypoints': follow_detection['keypoints'],
+                'score': float(follow_score),
+                'proximity': True
+            }
 
     #region UTILITY
 
