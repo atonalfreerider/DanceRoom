@@ -215,46 +215,185 @@ class DancerTracker:
             print(f"{race}: {count}")
 
     def create_role_assignments(self):
-        """Create lead and follow assignments based on gender analysis"""
-        lead_poses = {}
-        follow_poses = {}
+        """Create lead and follow assignments using multi-factor analysis"""
+        print("Creating role assignments with multi-factor analysis...")
         
-        # Group analyses by frame number
-        frame_analyses = defaultdict(list)
-        for file_name, analysis in self.face_analysis.items():
-            frame_analyses[analysis['frame_num']].append(analysis)
+        # First pass: Analyze tracks for gender and race consistency
+        track_analysis = self.analyze_tracks_demographics()
         
-        # Create pose assignments
-        for frame_num in self.detections:
-            detections_in_frame = self.detections[frame_num]
-            analyses_in_frame = frame_analyses.get(frame_num, [])
-            
-            for analysis in analyses_in_frame:
-                track_id = analysis['track_id']
-                pose = next(
-                    (d for d in detections_in_frame if d['id'] == track_id),
-                    None
-                )
-                
-                if pose:
-                    pose_data = {
-                        'id': pose['id'],
-                        'bbox': pose['bbox'],
-                        'confidence': pose['confidence'],
-                        'keypoints': pose['keypoints'],
-                        'gender_confidence': analysis['gender_confidence'],
-                        'race': analysis['dominant_race'],
-                        'race_confidence': analysis['race_confidence']
-                    }
-                    
-                    if analysis['dominant_gender'] == 'Man':
-                        lead_poses[str(frame_num)] = pose_data
-                    else:
-                        follow_poses[str(frame_num)] = pose_data
+        # Second pass: Create frame-by-frame assignments
+        lead_poses, follow_poses = self.assign_roles_over_time(track_analysis)
         
         # Save assignments
         self.save_json(lead_poses, self.lead_file)
         self.save_json(follow_poses, self.follow_file)
+
+    def analyze_tracks_demographics(self):
+        """Analyze demographic consistency for each track"""
+        track_data = defaultdict(lambda: {
+            'frames': [],
+            'male_votes': 0,
+            'female_votes': 0,
+            'male_confidence': 0,
+            'female_confidence': 0,
+            'race_votes': defaultdict(float),  # Will store confidence-weighted votes
+            'positions': []  # Will store (frame_num, x, y) tuples
+        })
+        
+        # Group and analyze all detections by track
+        for file_name, analysis in self.face_analysis.items():
+            track_id = analysis['track_id']
+            frame_num = analysis['frame_num']
+            
+            # Get detection for position analysis
+            detection = next(
+                (d for d in self.detections.get(frame_num, []) 
+                 if d['id'] == track_id),
+                None
+            )
+            
+            if detection:
+                # Store frame and center position of head
+                bbox = detection['bbox']
+                center_x = (bbox[0] + bbox[2]) / 2
+                center_y = (bbox[1] + bbox[3]) / 2
+                track_data[track_id]['positions'].append((frame_num, center_x, center_y))
+                track_data[track_id]['frames'].append(frame_num)
+                
+                # Add gender vote weighted by confidence
+                if analysis['dominant_gender'] == 'Man':
+                    track_data[track_id]['male_votes'] += 1
+                    track_data[track_id]['male_confidence'] += analysis['gender_confidence']
+                else:
+                    track_data[track_id]['female_votes'] += 1
+                    track_data[track_id]['female_confidence'] += analysis['gender_confidence']
+                
+                # Simplify and add race vote
+                race = analysis['dominant_race']
+                confidence = analysis['race_confidence']
+                simplified_race = 'dark' if race in ['indian', 'black'] else 'light'
+                track_data[track_id]['race_votes'][simplified_race] += confidence
+        
+        # Analyze each track for consistency
+        track_analysis = {}
+        for track_id, data in track_data.items():
+            if not data['frames']:  # Skip empty tracks
+                continue
+                
+            # Determine predominant gender
+            male_score = data['male_confidence'] / max(1, data['male_votes'])
+            female_score = data['female_confidence'] / max(1, data['female_votes'])
+            
+            # Determine predominant race
+            race_scores = data['race_votes']
+            dominant_race = max(race_scores.items(), key=lambda x: x[1])[0] if race_scores else None
+            
+            # Calculate motion consistency
+            positions = data['positions']
+            motion_consistent = True
+            if len(positions) > 1:
+                for i in range(1, len(positions)):
+                    prev_frame, prev_x, prev_y = positions[i-1]
+                    curr_frame, curr_x, curr_y = positions[i]
+                    
+                    if curr_frame - prev_frame == 1:  # Consecutive frames
+                        distance = ((curr_x - prev_x)**2 + (curr_y - prev_y)**2)**0.5
+                        if distance > self.frame_width * 0.1:  # More than 10% of frame width
+                            motion_consistent = False
+                            break
+            
+            track_analysis[track_id] = {
+                'frames': sorted(data['frames']),
+                'gender_score': {'male': male_score, 'female': female_score},
+                'dominant_race': dominant_race,
+                'race_confidence': max(race_scores.values()) if race_scores else 0,
+                'motion_consistent': motion_consistent
+            }
+        
+        return track_analysis
+
+    def assign_roles_over_time(self, track_analysis):
+        """Assign lead and follow roles frame by frame using track analysis"""
+        lead_poses = {}
+        follow_poses = {}
+        
+        # Get all frame numbers
+        all_frames = sorted(set(self.detections.keys()))
+        
+        # For each frame, find the best lead/follow pair
+        for frame_num in all_frames:
+            detections_in_frame = self.detections.get(frame_num, [])
+            
+            # Get valid tracks in this frame
+            valid_tracks = []
+            for detection in detections_in_frame:
+                track_id = detection['id']
+                if track_id in track_analysis:
+                    analysis = track_analysis[track_id]
+                    if analysis['motion_consistent']:
+                        valid_tracks.append((track_id, detection, analysis))
+            
+            # Skip if we don't have at least two tracks
+            if len(valid_tracks) < 2:
+                continue
+            
+            # Score each track for lead/follow roles
+            lead_candidates = []
+            follow_candidates = []
+            
+            for track_id, detection, analysis in valid_tracks:
+                male_score = analysis['gender_score']['male']
+                female_score = analysis['gender_score']['female']
+                
+                # Calculate role scores
+                lead_score = male_score * (1 + analysis['race_confidence'])
+                follow_score = female_score * (1 + analysis['race_confidence'])
+                
+                lead_candidates.append((lead_score, track_id, detection))
+                follow_candidates.append((follow_score, track_id, detection))
+            
+            # Sort candidates by score
+            lead_candidates.sort(reverse=True)
+            follow_candidates.sort(reverse=True)
+            
+            # Assign roles ensuring we don't use the same track twice
+            lead_assigned = False
+            follow_assigned = False
+            
+            for lead_score, lead_id, lead_detection in lead_candidates:
+                if lead_assigned:
+                    break
+                    
+                for follow_score, follow_id, follow_detection in follow_candidates:
+                    if follow_assigned:
+                        break
+                        
+                    if lead_id != follow_id:  # Ensure different tracks
+                        # Create lead assignment
+                        lead_poses[str(frame_num)] = {
+                            'id': lead_detection['id'],
+                            'bbox': lead_detection['bbox'],
+                            'confidence': lead_detection['confidence'],
+                            'keypoints': lead_detection['keypoints'],
+                            'score': float(lead_score)
+                        }
+                        lead_assigned = True
+                        
+                        # Create follow assignment
+                        follow_poses[str(frame_num)] = {
+                            'id': follow_detection['id'],
+                            'bbox': follow_detection['bbox'],
+                            'confidence': follow_detection['confidence'],
+                            'keypoints': follow_detection['keypoints'],
+                            'score': float(follow_score)
+                        }
+                        follow_assigned = True
+                        break
+                
+                if lead_assigned and follow_assigned:
+                    break
+            
+            return lead_poses, follow_poses
 
     def interpolate_missing_assignments(self):
         """Step 6: Interpolate missing role assignments"""
