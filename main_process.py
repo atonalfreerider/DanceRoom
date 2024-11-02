@@ -14,8 +14,8 @@ def main(input_video, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     # use depth maps from UniDepth to isolate figures dancing in center of floor
-    segmenter = Segmenter(input_video, output_dir)
-    segmenter.process_video()
+    #segmenter = Segmenter(input_video, output_dir)
+    #segmenter.process_video()
 
     # use YOLOv11 to detect poses of figures and track them
     yoloPose = yolo_pose.YOLOPose(output_dir + "/figure-masks", output_dir + "/detections.json")
@@ -44,8 +44,8 @@ def main(input_video, output_dir):
     #smoother = TemporalSmoothing(output_dir)
     #smoother.run()
 
-    #debug_video = DebugVideo(input_video, output_dir)
-    #debug_video.generate_debug_video()
+    debug_video = DebugVideo(input_video, output_dir)
+    debug_video.generate_debug_video()
 
 
 if __name__ == "__main__":

@@ -4,9 +4,7 @@ import json
 import os
 import tqdm
 from deepface import DeepFace
-import shutil
 from collections import defaultdict
-import random
 
 # uses DeepFace to find self-similar faces and gender
 class DancerTracker:
@@ -18,13 +16,9 @@ class DancerTracker:
         
         # New directories for face processing
         self.faces_dir = os.path.join(output_dir, 'faces')
-        self.person_dirs = os.path.join(output_dir, 'person_clusters')
-        self.lead_faces_dir = os.path.join(output_dir, 'lead_faces')
-        self.follow_faces_dir = os.path.join(output_dir, 'follow_faces')
-        
+
         # Create necessary directories
-        for dir_path in [self.faces_dir, self.person_dirs, 
-                        self.lead_faces_dir, self.follow_faces_dir]:
+        for dir_path in [self.faces_dir]:
             os.makedirs(dir_path, exist_ok=True)
 
         self.detections_file = os.path.join(output_dir, 'detections.json')
@@ -239,7 +233,7 @@ class DancerTracker:
             'positions': [],
             'high_confidence_points': [],
             'stable_segments': [],
-            'size_measurements': []  # Add size measurements
+            'size_ratios': []  # Store size ratios instead of absolute measurements
         })
 
         simplified_race = 'dark'
@@ -259,7 +253,7 @@ class DancerTracker:
                 # Add size measurement
                 size = self._calculate_person_size(detection['keypoints'])
                 if size > 0:
-                    track_data[track_id]['size_measurements'].append(size)
+                    track_data[track_id]['size_ratios'].append(size)
 
                 bbox = detection['bbox']
                 center_x = (bbox[0] + bbox[2]) / 2
@@ -316,6 +310,34 @@ class DancerTracker:
                                 'confidence': detection['confidence']
                             })
         
+        # Second pass: Calculate relative sizes for each frame with two people
+        for frame_num in self.detections:
+            detections = self.detections[frame_num]
+            if len(detections) == 2:
+                det1, det2 = detections
+                ratio = self._calculate_relative_size_ratio(
+                    det1['keypoints'],
+                    det2['keypoints']
+                )
+                if ratio is not None:
+                    track_data[det1['id']]['size_ratios'].append(ratio)
+                    track_data[det2['id']]['size_ratios'].append(1/ratio)
+        
+        # Calculate size scores from ratios
+        for track_id, data in track_data.items():
+            if data['size_ratios']:
+                # Remove outliers (ratios outside 2 standard deviations)
+                ratios = np.array(data['size_ratios'])
+                mean_ratio = np.mean(ratios)
+                std_ratio = np.std(ratios)
+                filtered_ratios = ratios[np.abs(ratios - mean_ratio) <= 2 * std_ratio]
+                
+                # Convert median ratio to a 0-1 score where >1 means larger
+                median_ratio = np.median(filtered_ratios) if len(filtered_ratios) > 0 else mean_ratio
+                data['size_score'] = 1 / (1 + np.exp(-2 * (median_ratio - 1)))  # Sigmoid centered at 1
+            else:
+                data['size_score'] = 0.5  # Neutral score if no ratios available
+        
         # Modify track analysis to include size
         track_analysis = {}
         for track_id, data in track_data.items():
@@ -323,7 +345,7 @@ class DancerTracker:
                 continue
             
             # Calculate average size when enough measurements exist
-            size_measurements = data['size_measurements']
+            size_measurements = data['size_ratios']
             if len(size_measurements) > 5:  # Require minimum measurements
                 # Remove outliers (measurements outside 2 standard deviations)
                 mean_size = np.mean(size_measurements)
@@ -427,62 +449,11 @@ class DancerTracker:
         
         return stable_segments
 
-    @staticmethod
-    def _analyze_track_stability(track_data):
-        """Analyze tracks with emphasis on stability and proximity"""
-        track_analysis = {}
-        
-        # First pass: Calculate basic stability metrics
-        for track_id, data in track_data.items():
-            if not data['frames']:
-                continue
-            
-            # Calculate demographic consensus
-            total_votes = data['male_votes'] + data['female_votes']
-            if total_votes > 0:
-                male_ratio = data['male_votes'] / total_votes
-                female_ratio = data['female_votes'] / total_votes
-                gender_consensus = max(male_ratio, female_ratio)
-            else:
-                gender_consensus = 0
-            
-            # Calculate race consensus
-            race_votes = data['race_votes']
-            total_race_votes = sum(race_votes.values())
-            race_consensus = max(race_votes.values()) / total_race_votes if total_race_votes > 0 else 0
-            
-            # Calculate tracking stability score
-            stability_score = sum(
-                segment['end_frame'] - segment['start_frame'] 
-                for segment in data['stable_segments']
-            ) / len(data['frames']) if data['frames'] else 0
-            
-            track_analysis[track_id] = {
-                'frames': sorted(data['frames']),
-                'stable_segments': data['stable_segments'],
-                'gender_consensus': gender_consensus,
-                'dominant_gender': 'Man' if data['male_votes'] > data['female_votes'] else 'Woman',
-                'race_consensus': race_consensus,
-                'dominant_race': max(data['race_votes'].items(), key=lambda x: x[1])[0] if data['race_votes'] else None,
-                'stability_score': stability_score,
-                'positions': sorted(data['positions'], key=lambda x: x[0]),
-                'average_size': data['average_size']  # Add size to analysis
-            }
-        
-        return track_analysis
-
     def assign_roles_over_time(self, track_analysis):
         """Assign roles with emphasis on track stability and ensuring role coverage"""
         lead_poses = {}
         follow_poses = {}
-        
-        # Sort tracks by stability score
-        sorted_tracks = sorted(
-            track_analysis.items(),
-            key=lambda x: x[1]['stability_score'],
-            reverse=True
-        )
-        
+
         # Initialize role assignments
         current_lead = None
         current_follow = None
@@ -560,18 +531,25 @@ class DancerTracker:
             if frame_str not in lead_poses or frame_str not in follow_poses:
                 scores = []
                 for track_id, detection, analysis in active_tracks:
+                    # Calculate size-weighted lead score
+                    size_score = analysis.get('size_score', 0.5)
+                    size_factor = 6.0 if size_score > 0.6 else (-6.0 if size_score < 0.4 else 0)
+                    
                     lead_score = (
-                        (analysis['stability_score'] * 2) +
-                        (1.0 if analysis['dominant_gender'] == 'Man' else 0) +
-                        analysis.get('size_score', 0) +  # Add size score
-                        (0.5 if track_id == current_lead else 0)
+                        (analysis['stability_score']) +  # Base stability weight
+                        (8.0 if analysis['dominant_gender'] == 'Man' else 0) +  # Increased from 3.0 to 8.0
+                        size_factor +  # Heavy size factor
+                        (0.25 if track_id == current_lead else 0)  # Reduced continuity bonus
                     )
+                    
+                    # Inverse scoring for follow role
                     follow_score = (
-                        (analysis['stability_score'] * 2) +
-                        (1.0 if analysis['dominant_gender'] == 'Woman' else 0) +
-                        (1.0 - analysis.get('size_score', 0)) +  # Inverse size score for follow
-                        (0.5 if track_id == current_follow else 0)
+                        (analysis['stability_score']) +
+                        (8.0 if analysis['dominant_gender'] == 'Woman' else 0) +  # Increased from 3.0 to 8.0
+                        (-size_factor) +  # Inverse size factor
+                        (0.25 if track_id == current_follow else 0)
                     )
+                    
                     scores.append((track_id, detection, analysis, lead_score, follow_score))
                 
                 # Sort by total score
@@ -703,21 +681,25 @@ class DancerTracker:
         for track_id, detection, analysis in active_tracks:
             score = 0
             
-            # Add stability score
-            score += analysis['stability_score'] * 2
+            # Add stability score (reduced relative weight)
+            score += analysis['stability_score']
             
-            # Add demographic consensus score
+            # Add demographic consensus score (heavily increased)
             if analysis['dominant_gender'] == 'Man':
-                score += analysis['gender_consensus']
+                score += analysis['gender_consensus'] * 8.0  # Increased from 3.0 to 8.0
             
-            # Add size score with same weight as gender
-            score += analysis.get('size_score', 0)
+            # Add heavily weighted size score
+            size_score = analysis.get('size_score', 0.5)
+            if size_score > 0.6:  # If clearly larger
+                score += 6.0  # Strong bonus for lead role
+            elif size_score < 0.4:  # If clearly smaller
+                score -= 6.0  # Strong penalty for lead role
             
-            # Add continuity bonus
+            # Add continuity bonus (reduced relative to size and gender)
             if track_id == current_lead:
-                score += 0.5
+                score += 0.25
             elif track_id == current_follow:
-                score -= 0.5
+                score -= 0.25
             
             scores.append((score, track_id, detection, analysis))
         
@@ -826,6 +808,59 @@ class DancerTracker:
                 point_count += 1
         
         return total_length / point_count if point_count > 0 else 0
+
+    def _calculate_relative_size_ratio(self, keypoints1, keypoints2):
+        """Calculate size ratio between two people using only torso and legs"""
+        # Key measurements to compare
+        measurements = [
+            (11, 13),  # Left upper leg
+            (13, 15),  # Left lower leg
+            (12, 14),  # Right upper leg
+            (14, 16),  # Right lower leg
+            (5, 11),   # Left torso
+            (6, 12),   # Right torso
+        ]
+        
+        ratios = []
+        
+        for start_idx, end_idx in measurements:
+            # Check if both people have valid measurements for this segment
+            if (start_idx < len(keypoints1) and end_idx < len(keypoints1) and
+                start_idx < len(keypoints2) and end_idx < len(keypoints2)):
+                
+                # Check confidence and validity for person 1
+                valid1 = (keypoints1[start_idx][2] > 0.3 and 
+                         keypoints1[end_idx][2] > 0.3 and
+                         not (keypoints1[start_idx][0] == 0 and keypoints1[start_idx][1] == 0) and
+                         not (keypoints1[end_idx][0] == 0 and keypoints1[end_idx][1] == 0))
+                
+                # Check confidence and validity for person 2
+                valid2 = (keypoints2[start_idx][2] > 0.3 and 
+                         keypoints2[end_idx][2] > 0.3 and
+                         not (keypoints2[start_idx][0] == 0 and keypoints2[start_idx][1] == 0) and
+                         not (keypoints2[end_idx][0] == 0 and keypoints2[end_idx][1] == 0))
+                
+                # Only calculate ratio if both people have valid measurements
+                if valid1 and valid2:
+                    # Calculate length for person 1
+                    length1 = np.sqrt(
+                        (keypoints1[end_idx][0] - keypoints1[start_idx][0])**2 +
+                        (keypoints1[end_idx][1] - keypoints1[start_idx][1])**2
+                    )
+                    
+                    # Calculate length for person 2
+                    length2 = np.sqrt(
+                        (keypoints2[end_idx][0] - keypoints2[start_idx][0])**2 +
+                        (keypoints2[end_idx][1] - keypoints2[start_idx][1])**2
+                    )
+                    
+                    if length2 > 0:  # Avoid division by zero
+                        ratios.append(length1 / length2)
+        
+        # Return median ratio if we have enough measurements
+        if len(ratios) >= 2:  # Require at least 2 valid comparisons
+            return np.median(ratios)
+        return None
 
     #endregion
 
