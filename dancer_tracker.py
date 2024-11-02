@@ -47,8 +47,8 @@ class DancerTracker:
         else:
             print(f"Found {len(existing_faces)} existing face crops, skipping extraction...")
         
-        self.cluster_faces()
-        self.analyze_gender_and_assign_roles()
+        self.analyze_and_sort_by_gender()
+        self.create_role_assignments()
         self.interpolate_missing_assignments()
         print("Lead and follow tracked using DeepFace approach")
 
@@ -132,142 +132,52 @@ class DancerTracker:
         
         return [int(x_min), int(y_min), int(x_max), int(y_max)]
 
-    def cluster_faces(self):
-        """Steps 2-3: Cluster faces using DeepFace.find"""
-        print("Clustering faces...")
+    def analyze_and_sort_by_gender(self):
+        """Analyze each face for gender and sort into lead/follow folders"""
+        print("Analyzing faces for gender...")
+        
+        # Clear existing role directories
+        for dir_path in [self.lead_faces_dir, self.follow_faces_dir]:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
+            os.makedirs(dir_path)
+        
         face_files = os.listdir(self.faces_dir)
         
         if not face_files:
             raise Exception("No face crops found!")
-            
-        # Take a random sample of faces to analyze
-        sample_size = min(20, len(face_files))
-        sample_faces = random.sample(face_files, sample_size)
         
-        clusters = defaultdict(list)
-        processed_files = set()
-        
-        for face_file in tqdm.tqdm(sample_faces):
-            if face_file in processed_files:
-                continue
-                
+        for face_file in tqdm.tqdm(face_files):
             try:
                 img_path = os.path.join(self.faces_dir, face_file)
-                dfs = DeepFace.find(
+                result = DeepFace.analyze(
                     img_path=img_path,
-                    db_path=self.faces_dir,
+                    actions=['gender'],
                     enforce_detection=False
                 )
                 
-                if dfs[0].empty:
-                    continue
-                    
-                # Create new cluster
-                cluster_id = len(clusters)
-                similar_faces = dfs[0]['identity'].tolist()
+                if isinstance(result, list):
+                    result = result[0]
                 
-                # Add similar faces to cluster
-                for face_path in similar_faces:
-                    face_name = os.path.basename(face_path)
-                    clusters[cluster_id].append(face_name)
-                    processed_files.add(face_name)
+                # Copy to appropriate folder based on gender
+                if result['dominant_gender'] == 'Man':
+                    dst = os.path.join(self.lead_faces_dir, face_file)
+                else:  # 'Woman'
+                    dst = os.path.join(self.follow_faces_dir, face_file)
                     
+                shutil.copy2(img_path, dst)
+                
             except Exception as e:
-                print(f"Error processing {face_file}: {str(e)}")
+                print(f"Error analyzing {face_file}: {str(e)}")
                 continue
         
-        # Keep the two largest clusters
-        sorted_clusters = sorted(
-            clusters.items(), 
-            key=lambda x: len(x[1]), 
-            reverse=True
-        )[:2]
-        
-        # Copy files to person directories
-        for idx, (cluster_id, files) in enumerate(sorted_clusters):
-            person_dir = os.path.join(self.person_dirs, f"person_{idx+1}")
-            os.makedirs(person_dir, exist_ok=True)
-            
-            for file in files:
-                src = os.path.join(self.faces_dir, file)
-                dst = os.path.join(person_dir, file)
-                shutil.copy2(src, dst)
+        # Print statistics
+        lead_count = len(os.listdir(self.lead_faces_dir))
+        follow_count = len(os.listdir(self.follow_faces_dir))
+        print(f"Sorted {lead_count} male (lead) and {follow_count} female (follow) faces")
 
-    def analyze_gender_and_assign_roles(self):
-        """Step 4: Analyze gender and assign lead/follow roles"""
-        print("Analyzing gender and assigning roles...")
-        
-        person_dirs = [d for d in os.listdir(self.person_dirs) 
-                      if d.startswith('person_')]
-        
-        gender_counts = {}
-        
-        for person_dir in person_dirs:
-            dir_path = os.path.join(self.person_dirs, person_dir)
-            files = os.listdir(dir_path)
-            
-            # Sample up to 10 images for gender analysis
-            sample_size = min(10, len(files))
-            sample_files = random.sample(files, sample_size)
-            
-            male_count = 0
-            female_count = 0
-            
-            for file in sample_files:
-                try:
-                    img_path = os.path.join(dir_path, file)
-                    result = DeepFace.analyze(
-                        img_path=img_path,
-                        actions=['gender'],
-                        enforce_detection=False
-                    )
-                    
-                    if isinstance(result, list):
-                        result = result[0]
-                        
-                    if result['gender'] == 'Man':
-                        male_count += 1
-                    else:
-                        female_count += 1
-                        
-                except Exception as e:
-                    print(f"Error analyzing {file}: {str(e)}")
-                    continue
-            
-            gender_counts[person_dir] = {
-                'male': male_count,
-                'female': female_count
-            }
-        
-        # Assign roles based on gender counts
-        sorted_dirs = sorted(
-            gender_counts.items(),
-            key=lambda x: x[1]['male'],
-            reverse=True
-        )
-        
-        if len(sorted_dirs) >= 2:
-            lead_dir = sorted_dirs[0][0]
-            follow_dir = sorted_dirs[1][0]
-            
-            # Copy files to role-specific directories
-            self._copy_files_to_role_dir(lead_dir, self.lead_faces_dir)
-            self._copy_files_to_role_dir(follow_dir, self.follow_faces_dir)
-            
-            # Create role assignments
-            self._create_role_assignments()
-
-    def _copy_files_to_role_dir(self, person_dir, role_dir):
-        """Helper to copy files from person directory to role directory"""
-        src_dir = os.path.join(self.person_dirs, person_dir)
-        for file in os.listdir(src_dir):
-            shutil.copy2(
-                os.path.join(src_dir, file),
-                os.path.join(role_dir, file)
-            )
-
-    def _create_role_assignments(self):
-        """Create lead and follow assignments based on face analysis"""
+    def create_role_assignments(self):
+        """Create lead and follow assignments based on gender analysis"""
         lead_poses = {}
         follow_poses = {}
         
