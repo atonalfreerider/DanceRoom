@@ -12,13 +12,6 @@ class DancerTracker:
         self.input_path = input_path
         self.output_dir = output_dir
         self.depth_dir = os.path.join(output_dir, 'depth')
-        
-        # New directories for face processing
-        self.faces_dir = os.path.join(output_dir, 'faces')
-
-        # Create necessary directories
-        for dir_path in [self.faces_dir]:
-            os.makedirs(dir_path, exist_ok=True)
 
         self.detections_file = os.path.join(output_dir, 'detections.json')
         self.lead_file = os.path.join(output_dir, 'lead.json')
@@ -36,26 +29,29 @@ class DancerTracker:
         self.analysis_cache_file = os.path.join(output_dir, 'face_analysis.json')
 
         self.face_analysis = {}
-        
-        # Remove folder creation for lead/follow dirs since we won't use them
-        for dir_path in [self.faces_dir]:
-            os.makedirs(dir_path, exist_ok=True)
 
     def process_video(self):
-        # Check if faces directory already has crops
-        existing_faces = os.listdir(self.faces_dir)
-        if not existing_faces:
-            self.extract_face_crops()
+        # Check if we have cached analysis
+        if os.path.exists(self.analysis_cache_file):
+            print("Loading cached face analysis results...")
+            with open(self.analysis_cache_file, 'r') as f:
+                self.face_analysis = json.load(f)
+            
+            # Print statistics from cache
+            male_count = sum(1 for data in self.face_analysis.values() 
+                            if data['dominant_gender'] == 'Man')
+            female_count = sum(1 for data in self.face_analysis.values() 
+                              if data['dominant_gender'] == 'Woman')
+            print(f"Loaded {male_count} male and {female_count} female cached analyses")
         else:
-            print(f"Found {len(existing_faces)} existing face crops, skipping extraction...")
+            self.analyze_video_faces()
         
-        self.analyze_faces()
         self.create_role_assignments()
         print("Lead and follow tracked using DeepFace approach")
 
-    def extract_face_crops(self):
-        """Step 1: Extract face crops from poses meeting height threshold"""
-        print("Extracting face crops...")
+    def analyze_video_faces(self):
+        """Extract and analyze faces directly from video frames"""
+        print("Analyzing faces from video...")
         
         # Open video capture
         cap = cv2.VideoCapture(self.input_path)
@@ -84,114 +80,38 @@ class DancerTracker:
                         head_img = frame[y1:y2, x1:x2]
                         
                         if head_img.size > 0:
-                            output_path = os.path.join(
-                                self.faces_dir, 
-                                f"{frame_num:06d}-{detection['id']}.jpg"
-                            )
-                            cv2.imwrite(output_path, head_img)
+                            try:
+                                # Analyze face directly from numpy array
+                                result = DeepFace.analyze(
+                                    img_path=head_img,  # Pass numpy array directly
+                                    actions=['gender', 'race'],
+                                    enforce_detection=False,
+                                    silent=True
+                                )
+                                
+                                if isinstance(result, list):
+                                    result = result[0]
+                                
+                                # Generate a unique key for this face
+                                face_key = f"{frame_num:06d}-{detection['id']}"
+                                
+                                # Store analysis results
+                                self.face_analysis[face_key] = {
+                                    'frame_num': frame_num,
+                                    'track_id': detection['id'],
+                                    'dominant_gender': result['dominant_gender'],
+                                    'gender_confidence': result['gender'][result['dominant_gender']],
+                                    'dominant_race': result['dominant_race'],
+                                    'race_confidence': result['race'][result['dominant_race']]
+                                }
+                                    
+                            except Exception as e:
+                                print(f"Error analyzing face in frame {frame_num}, "
+                                      f"track {detection['id']}: {str(e)}")
+                                continue
         
         # Release video capture
         cap.release()
-
-    def get_head_bbox(self, keypoints, padding_percent=0.25):
-        """Extract square head bounding box from keypoints with padding"""
-        # Get head keypoints (nose, eyes, ears) - indices 0-4
-        head_points = keypoints[:5]
-        
-        # Filter out low confidence or missing points (0,0 coordinates)
-        valid_points = [point for point in head_points
-                        if point[2] > 0.3 and (point[0] != 0 or point[1] != 0)]
-        
-        if not valid_points:
-            return None
-            
-        # Convert to numpy array for easier computation
-        points = np.array(valid_points)[:, :2]  # Only take x,y coordinates
-        
-        # Get bounding box
-        x_min, y_min = np.min(points, axis=0)
-        x_max, y_max = np.max(points, axis=0)
-        
-        # Calculate center point
-        center_x = (x_min + x_max) / 2
-        center_y = (y_min + y_max) / 2
-        
-        # Get the larger dimension for square crop
-        width = x_max - x_min
-        height = y_max - y_min
-        size = max(width, height)
-        
-        # Add padding
-        size_with_padding = size * (1 + 2 * padding_percent)
-        half_size = size_with_padding / 2
-        
-        # Calculate square bounds from center
-        x_min = center_x - half_size
-        x_max = center_x + half_size
-        y_min = center_y - half_size
-        y_max = center_y + half_size
-        
-        # Ensure bounds are within frame
-        x_min = max(0, x_min)
-        y_min = max(0, y_min)
-        x_max = min(self.frame_width, x_max)
-        y_max = min(self.frame_height, y_max)
-        
-        return [int(x_min), int(y_min), int(x_max), int(y_max)]
-
-    def analyze_faces(self):
-        """Analyze each face for gender and race, cache results"""
-        # Check for existing analysis cache
-        if os.path.exists(self.analysis_cache_file):
-            print("Loading cached face analysis results...")
-            with open(self.analysis_cache_file, 'r') as f:
-                self.face_analysis = json.load(f)
-            
-            # Print statistics from cache
-            male_count = sum(1 for data in self.face_analysis.values() 
-                            if data['dominant_gender'] == 'Man')
-            female_count = sum(1 for data in self.face_analysis.values() 
-                              if data['dominant_gender'] == 'Woman')
-            print(f"Loaded {male_count} male and {female_count} female cached analyses")
-            return
-
-        print("Analyzing faces for gender and race...")
-        face_files = os.listdir(self.faces_dir)
-        
-        if not face_files:
-            raise Exception("No face crops found!")
-        
-        for face_file in tqdm.tqdm(face_files):
-            try:
-                img_path = os.path.join(self.faces_dir, face_file)
-                result = DeepFace.analyze(
-                    img_path=img_path,
-                    actions=['gender', 'race'],
-                    enforce_detection=False
-                )
-                
-                if isinstance(result, list):
-                    result = result[0]
-                
-                # Parse frame number and track id from filename
-                frame_num, track_id = map(
-                    int,
-                    face_file.split('.')[0].split('-')
-                )
-                
-                # Store analysis results
-                self.face_analysis[face_file] = {
-                    'frame_num': frame_num,
-                    'track_id': track_id,
-                    'dominant_gender': result['dominant_gender'],
-                    'gender_confidence': result['gender'][result['dominant_gender']],
-                    'dominant_race': result['dominant_race'],
-                    'race_confidence': result['race'][result['dominant_race']]
-                }
-                    
-            except Exception as e:
-                print(f"Error analyzing {face_file}: {str(e)}")
-                continue
         
         # Save analysis cache
         with open(self.analysis_cache_file, 'w') as f:
@@ -202,7 +122,7 @@ class DancerTracker:
                         if data['dominant_gender'] == 'Man')
         female_count = sum(1 for data in self.face_analysis.values() 
                           if data['dominant_gender'] == 'Woman')
-        print(f"Analyzed {male_count} male and {female_count} female faces")
+        print(f"\nAnalyzed {male_count} male and {female_count} female faces")
         
         # Print race statistics
         race_counts = defaultdict(int)
@@ -211,6 +131,52 @@ class DancerTracker:
         print("\nRace distribution:")
         for race, count in race_counts.items():
             print(f"{race}: {count}")
+
+    def get_head_bbox(self, keypoints, padding_percent=0.25):
+        """Extract square head bounding box from keypoints with padding"""
+        # Get head keypoints (nose, eyes, ears) - indices 0-4
+        head_points = keypoints[:5]
+
+        # Filter out low confidence or missing points (0,0 coordinates)
+        valid_points = [point for point in head_points
+                        if point[2] > 0.3 and (point[0] != 0 or point[1] != 0)]
+
+        if not valid_points:
+            return None
+
+        # Convert to numpy array for easier computation
+        points = np.array(valid_points)[:, :2]  # Only take x,y coordinates
+
+        # Get bounding box
+        x_min, y_min = np.min(points, axis=0)
+        x_max, y_max = np.max(points, axis=0)
+
+        # Calculate center point
+        center_x = (x_min + x_max) / 2
+        center_y = (y_min + y_max) / 2
+
+        # Get the larger dimension for square crop
+        width = x_max - x_min
+        height = y_max - y_min
+        size = max(width, height)
+
+        # Add padding
+        size_with_padding = size * (1 + 2 * padding_percent)
+        half_size = size_with_padding / 2
+
+        # Calculate square bounds from center
+        x_min = center_x - half_size
+        x_max = center_x + half_size
+        y_min = center_y - half_size
+        y_max = center_y + half_size
+
+        # Ensure bounds are within frame
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(self.frame_width, x_max)
+        y_max = min(self.frame_height, y_max)
+
+        return [int(x_min), int(y_min), int(x_max), int(y_max)]
 
     def create_role_assignments(self):
         """Create lead and follow assignments using multi-factor analysis"""
@@ -228,17 +194,19 @@ class DancerTracker:
 
     def analyze_tracks_demographics(self):
         """Analyze demographic consistency with emphasis on track stability"""
+        # Initialize track_data with explicit types for each field
         track_data = defaultdict(lambda: {
             'frames': [],
             'male_votes': 0,
             'female_votes': 0,
-            'male_confidence': 0,
-            'female_confidence': 0,
+            'male_confidence': 0.0,
+            'female_confidence': 0.0,
             'race_votes': defaultdict(float),
             'positions': [],
             'high_confidence_points': [],
             'stable_segments': [],
-            'size_ratios': []  # Store size ratios instead of absolute measurements
+            'size_ratios': [],
+            'size_score': 0.0  # Initialize size_score as float
         })
 
         simplified_race = 'dark'
@@ -339,7 +307,7 @@ class DancerTracker:
                 
                 # Convert median ratio to a 0-1 score where >1 means larger
                 median_ratio = np.median(filtered_ratios) if len(filtered_ratios) > 0 else mean_ratio
-                data['size_score'] = 1 / (1 + np.exp(-2 * (median_ratio - 1)))  # Sigmoid centered at 1
+                data['size_score'] = float(1 / (1 + np.exp(-2 * (median_ratio - 1))))  # Explicit float conversion
             else:
                 data['size_score'] = 0.5  # Neutral score if no ratios available
         
@@ -814,7 +782,8 @@ class DancerTracker:
         
         return total_length / point_count if point_count > 0 else 0
 
-    def _calculate_relative_size_ratio(self, keypoints1, keypoints2):
+    @staticmethod
+    def _calculate_relative_size_ratio(keypoints1, keypoints2):
         """Calculate size ratio between two people using only torso and legs"""
         # Key measurements to compare
         measurements = [
