@@ -12,7 +12,6 @@ class DancerTracker:
         self.input_path = input_path
         self.output_dir = output_dir
         self.depth_dir = os.path.join(output_dir, 'depth')
-        self.figure_mask_dir = os.path.join(output_dir, 'figure-masks')
         
         # New directories for face processing
         self.faces_dir = os.path.join(output_dir, 'faces')
@@ -35,6 +34,8 @@ class DancerTracker:
 
         # Add new path for analysis cache
         self.analysis_cache_file = os.path.join(output_dir, 'face_analysis.json')
+
+        self.face_analysis = {}
         
         # Remove folder creation for lead/follow dirs since we won't use them
         for dir_path in [self.faces_dir]:
@@ -55,16 +56,19 @@ class DancerTracker:
     def extract_face_crops(self):
         """Step 1: Extract face crops from poses meeting height threshold"""
         print("Extracting face crops...")
-        frame_count = len(os.listdir(self.figure_mask_dir))
+        
+        # Open video capture
+        cap = cv2.VideoCapture(self.input_path)
+        if not cap.isOpened():
+            raise Exception(f"Could not open video file: {self.input_path}")
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         min_height_threshold = 0.6 * self.frame_height
         
-        for frame_num in tqdm.tqdm(range(frame_count)):
-            frame_path = os.path.join(self.figure_mask_dir, f"{frame_num:06d}.png")
-            if not os.path.exists(frame_path):
-                continue
-                
-            frame = cv2.imread(frame_path)
-            if frame is None:
+        for frame_num in tqdm.tqdm(range(total_frames)):
+            # Read frame
+            ret, frame = cap.read()
+            if not ret:
                 continue
                 
             detections_in_frame = self.detections.get(frame_num, [])
@@ -85,6 +89,9 @@ class DancerTracker:
                                 f"{frame_num:06d}-{detection['id']}.jpg"
                             )
                             cv2.imwrite(output_path, head_img)
+        
+        # Release video capture
+        cap.release()
 
     def get_head_bbox(self, keypoints, padding_percent=0.25):
         """Extract square head bounding box from keypoints with padding"""
@@ -153,8 +160,6 @@ class DancerTracker:
         
         if not face_files:
             raise Exception("No face crops found!")
-        
-        self.face_analysis = {}
         
         for face_file in tqdm.tqdm(face_files):
             try:
